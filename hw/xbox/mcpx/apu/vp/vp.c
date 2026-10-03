@@ -20,6 +20,10 @@
  */
 
 #include "hw/xbox/mcpx/apu/apu_int.h"
+
+#ifdef __APPLE__
+#include <sys/sysctl.h>
+#endif
 #include "adpcm.h"
 
 static const struct {
@@ -1764,11 +1768,28 @@ voice_work_dispatch(MCPXAPUState *d,
     qemu_mutex_unlock(&vwd->lock);
 }
 
+static int default_num_voice_workers(void)
+{
+#ifdef __APPLE__
+    /* Voices are dispatched to every worker each 32-sample frame (1500 Hz).
+     * Using all cores, efficiency cores included, mostly adds wakeups and
+     * waiting on the slowest worker; half the performance cores is enough.
+     */
+    int perf_cores = 0;
+    size_t len = sizeof(perf_cores);
+    if (sysctlbyname("hw.perflevel0.logicalcpu", &perf_cores, &len, NULL, 0) == 0 &&
+        perf_cores > 0) {
+        return MAX(2, perf_cores / 2);
+    }
+#endif
+    return SDL_GetNumLogicalCPUCores();
+}
+
 static void voice_work_init(MCPXAPUState *d)
 {
     VoiceWorkDispatch *vwd = &d->vp.voice_work_dispatch;
 
-    int num_workers = g_config.audio.vp.num_workers ?: SDL_GetNumLogicalCPUCores();
+    int num_workers = g_config.audio.vp.num_workers ?: default_num_voice_workers();
     vwd->num_workers = MAX(1, MIN(num_workers, MAX_VOICE_WORKERS));
     vwd->workers = g_malloc0_n(vwd->num_workers, sizeof(VoiceWorker));
     vwd->workers_should_exit = false;

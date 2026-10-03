@@ -334,10 +334,17 @@ static inline bool f64_is_inf(union_float64 a)
     return float64_is_infinity(a.s);
 }
 
+/*
+ * zero_exact: an exactly zero hardware result needs no soft fallback. True for
+ * add/sub, where a zero result from zero-or-normal inputs can only come from
+ * exact cancellation (+0 under round-to-nearest-even, which can_use_fpu
+ * guarantees). Tiny non-zero results still go soft for underflow and
+ * flush-to-zero handling.
+ */
 static inline float32
 float32_gen2(float32 xa, float32 xb, float_status *s,
              hard_f32_op2_fn hard, soft_f32_op2_fn soft,
-             f32_check_fn pre, f32_check_fn post)
+             f32_check_fn pre, f32_check_fn post, bool zero_exact)
 {
     union_float32 ua, ub, ur;
 
@@ -356,7 +363,8 @@ float32_gen2(float32 xa, float32 xb, float_status *s,
     ur.h = hard(ua.h, ub.h);
     if (unlikely(f32_is_inf(ur))) {
         float_raise(float_flag_overflow, s);
-    } else if (unlikely(fabsf(ur.h) <= FLT_MIN) && post(ua, ub)) {
+    } else if (unlikely(fabsf(ur.h) <= FLT_MIN) &&
+               !(zero_exact && ur.h == 0) && post(ua, ub)) {
         goto soft;
     }
     return ur.s;
@@ -368,7 +376,7 @@ float32_gen2(float32 xa, float32 xb, float_status *s,
 static inline float64
 float64_gen2(float64 xa, float64 xb, float_status *s,
              hard_f64_op2_fn hard, soft_f64_op2_fn soft,
-             f64_check_fn pre, f64_check_fn post)
+             f64_check_fn pre, f64_check_fn post, bool zero_exact)
 {
     union_float64 ua, ub, ur;
 
@@ -387,7 +395,8 @@ float64_gen2(float64 xa, float64 xb, float_status *s,
     ur.h = hard(ua.h, ub.h);
     if (unlikely(f64_is_inf(ur))) {
         float_raise(float_flag_overflow, s);
-    } else if (unlikely(fabs(ur.h) <= DBL_MIN) && post(ua, ub)) {
+    } else if (unlikely(fabs(ur.h) <= DBL_MIN) &&
+               !(zero_exact && ur.h == 0) && post(ua, ub)) {
         goto soft;
     }
     return ur.s;
@@ -1980,6 +1989,27 @@ static bool f32_addsubmul_post(union_float32 a, union_float32 b)
     return !(float32_is_zero(a.s) && float32_is_zero(b.s));
 }
 
+/*
+ * Multiplication: with zero-or-normal inputs, a zero input gives an exact
+ * signed zero product. Only tiny products of two non-zero inputs (underflow)
+ * need the soft fallback.
+ */
+static bool f32_mul_post(union_float32 a, union_float32 b)
+{
+    if (QEMU_HARDFLOAT_2F32_USE_FP) {
+        return !(fpclassify(a.h) == FP_ZERO || fpclassify(b.h) == FP_ZERO);
+    }
+    return !(float32_is_zero(a.s) || float32_is_zero(b.s));
+}
+
+static bool f64_mul_post(union_float64 a, union_float64 b)
+{
+    if (QEMU_HARDFLOAT_2F64_USE_FP) {
+        return !(fpclassify(a.h) == FP_ZERO || fpclassify(b.h) == FP_ZERO);
+    }
+    return !(float64_is_zero(a.s) || float64_is_zero(b.s));
+}
+
 static bool f64_addsubmul_post(union_float64 a, union_float64 b)
 {
     if (QEMU_HARDFLOAT_2F64_USE_FP) {
@@ -1993,14 +2023,14 @@ static float32 float32_addsub(float32 a, float32 b, float_status *s,
                               hard_f32_op2_fn hard, soft_f32_op2_fn soft)
 {
     return float32_gen2(a, b, s, hard, soft,
-                        f32_is_zon2, f32_addsubmul_post);
+                        f32_is_zon2, f32_addsubmul_post, true);
 }
 
 static float64 float64_addsub(float64 a, float64 b, float_status *s,
                               hard_f64_op2_fn hard, soft_f64_op2_fn soft)
 {
     return float64_gen2(a, b, s, hard, soft,
-                        f64_is_zon2, f64_addsubmul_post);
+                        f64_is_zon2, f64_addsubmul_post, true);
 }
 
 float32 QEMU_FLATTEN
@@ -2170,14 +2200,14 @@ float32 QEMU_FLATTEN
 float32_mul(float32 a, float32 b, float_status *s)
 {
     return float32_gen2(a, b, s, hard_f32_mul, soft_f32_mul,
-                        f32_is_zon2, f32_addsubmul_post);
+                        f32_is_zon2, f32_mul_post, false);
 }
 
 float64 QEMU_FLATTEN
 float64_mul(float64 a, float64 b, float_status *s)
 {
     return float64_gen2(a, b, s, hard_f64_mul, soft_f64_mul,
-                        f64_is_zon2, f64_addsubmul_post);
+                        f64_is_zon2, f64_mul_post, false);
 }
 
 float64 float64r32_mul(float64 a, float64 b, float_status *status)
@@ -2578,14 +2608,14 @@ float32 QEMU_FLATTEN
 float32_div(float32 a, float32 b, float_status *s)
 {
     return float32_gen2(a, b, s, hard_f32_div, soft_f32_div,
-                        f32_div_pre, f32_div_post);
+                        f32_div_pre, f32_div_post, false);
 }
 
 float64 QEMU_FLATTEN
 float64_div(float64 a, float64 b, float_status *s)
 {
     return float64_gen2(a, b, s, hard_f64_div, soft_f64_div,
-                        f64_div_pre, f64_div_post);
+                        f64_div_pre, f64_div_post, false);
 }
 
 float64 float64r32_div(float64 a, float64 b, float_status *status)

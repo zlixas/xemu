@@ -763,6 +763,10 @@ void MainMenuDisplayView::Draw()
                      "Increase surface scaling factor for higher quality")) {
         nv2a_set_surface_scale_factor(rendering_scale+1);
     }
+    Toggle("Fast depth", &g_config.display.quality.fast_depth,
+           "Use fixed-function depth instead of geometry shader emulation "
+           "(OpenGL only). Much faster on Apple Silicon, may cause depth "
+           "artifacts in some games");
 
     SectionTitle("Window");
     bool fs = xemu_is_fullscreen();

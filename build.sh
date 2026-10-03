@@ -228,6 +228,14 @@ case "$platform" in # Adjust compilation options based on platform
                         -arch ${target_arch} \
                         -isysroot ${sdk}"
         sys_ldflags='-headerpad_max_install_names'
+        if [ "$target_arch" == "arm64" ] && [ -z "$debug" ]; then
+            # Target the baseline Apple Silicon core so one binary runs on every
+            # M-series Mac (set XEMU_MCPU=native to tune for the build host).
+            # -ffast-math is deliberately not used: guest FPU and NV2A shader
+            # emulation rely on IEEE NaN/Inf/signed-zero semantics.
+            build_cflags="${build_cflags} -mcpu=${XEMU_MCPU:-apple-m1}"
+            opts="$opts -Doptimization=3 -Db_lto=true -Db_lto_mode=thin"
+        fi
         export PKG_CONFIG_LIBDIR="${lib_prefix}/lib/pkgconfig"
         opts="$opts --disable-cocoa --cross-prefix="
         postbuild='package_macos'

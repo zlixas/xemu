@@ -18,7 +18,38 @@
  */
 
 #include "hw/xbox/nv2a/pgraph/pgraph.h"
+#include "ui/xemu-settings.h"
 #include "shaders.h"
+
+/*
+ * Fast depth: skip the geometry shader + barycentric depth interpolation added
+ * for depth precision where fixed-function rasterization suffices. Geometry
+ * shaders are emulated on Apple Silicon (Metal has no geometry stage) and
+ * shader depth writes defeat hidden surface removal on tile-based GPUs, so
+ * this is a large win there at the cost of depth accuracy in a few titles.
+ * Only the OpenGL backend implements the fixed-function polygon offset needed.
+ */
+static bool no_geometry_shader(PGRAPHState *pg)
+{
+    return pg->renderer->ops.get_gpu_properties &&
+           pg->renderer->ops.get_gpu_properties()->no_geometry_shader;
+}
+
+static bool use_fast_depth(PGRAPHState *pg)
+{
+    return no_geometry_shader(pg) ||
+           (g_config.display.quality.fast_depth &&
+            (pg->renderer->type == CONFIG_DISPLAY_RENDERER_OPENGL ||
+             pg->renderer->type == CONFIG_DISPLAY_RENDERER_VULKAN));
+}
+
+void pgraph_glsl_get_geom_state(PGRAPHState *pg, GeomState *geom)
+{
+    memset(geom, 0, sizeof(*geom));
+    pgraph_glsl_set_geom_state(pg, geom);
+    geom->fast_depth = use_fast_depth(pg);
+    geom->no_geometry_shader = no_geometry_shader(pg);
+}
 
 ShaderState pgraph_glsl_get_shader_state(PGRAPHState *pg)
 {
@@ -30,8 +61,13 @@ ShaderState pgraph_glsl_get_shader_state(PGRAPHState *pg)
     memset(&state, 0, sizeof(ShaderState));
 
     pgraph_glsl_set_vsh_state(pg, &state.vsh);
-    pgraph_glsl_set_geom_state(pg, &state.geom);
+    /* All primitives must use the same depth method, even those still needing
+     * a geometry shader (e.g. quads), or multi-pass rendering of the same
+     * geometry gets mismatched depth values and z-fights.
+     */
+    pgraph_glsl_get_geom_state(pg, &state.geom);
     pgraph_glsl_set_psh_state(pg, &state.psh);
+    state.psh.fast_depth = state.geom.fast_depth;
 
     return state;
 }
@@ -74,7 +110,8 @@ bool pgraph_glsl_check_shader_state_dirty(PGRAPHState *pg,
         pg->compressed_attrs != state->vsh.compressed_attrs ||
         pg->primitive_mode != state->geom.primitive_mode ||
         pg->surface_scale_factor != state->vsh.surface_scale_factor ||
-        pg->surface_shape.zeta_format != state->psh.surface_zeta_format) {
+        pg->surface_shape.zeta_format != state->psh.surface_zeta_format ||
+        use_fast_depth(pg) != state->geom.fast_depth) {
         return true;
     }
 

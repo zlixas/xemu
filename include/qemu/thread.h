@@ -212,6 +212,19 @@ int qemu_thread_set_affinity(QemuThread *thread, unsigned long *host_cpus,
 int qemu_thread_get_affinity(QemuThread *thread, unsigned long **host_cpus,
                              unsigned long *nbits);
 void *qemu_thread_join(QemuThread *thread);
+
+/*
+ * Hint that the calling thread is latency critical. On macOS this raises the
+ * QoS class so the scheduler keeps the thread on performance cores rather
+ * than efficiency cores.
+ */
+static inline void qemu_thread_set_latency_critical(void)
+{
+#ifdef __APPLE__
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
+}
+
 void qemu_thread_get_self(QemuThread *thread);
 bool qemu_thread_is_self(QemuThread *thread);
 G_NORETURN void qemu_thread_exit(void *retval);

@@ -332,6 +332,19 @@ void xemu_hud_render()
         SDL_GL_SetSwapInterval(g_vsync ? 1 : 0);
     }
 
+    /* Testing aid: XEMU_AUTO_SCREENSHOT=<seconds> takes one screenshot after
+     * that many seconds of running. */
+    static gint64 auto_screenshot_at = -1;
+    if (auto_screenshot_at == -1) {
+        const char *env = getenv("XEMU_AUTO_SCREENSHOT");
+        auto_screenshot_at =
+            env ? g_get_monotonic_time() + atoi(env) * G_USEC_PER_SEC : 0;
+    }
+    if (auto_screenshot_at > 0 && g_get_monotonic_time() >= auto_screenshot_at) {
+        auto_screenshot_at = 0;
+        g_screenshot_pending = true;
+    }
+
     if (g_screenshot_pending) {
         SaveScreenshot(g_tex, g_flip_req);
         g_screenshot_pending = false;

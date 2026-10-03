@@ -20,6 +20,7 @@
  */
 
 #include "nv2a_int.h"
+#include "qemu/xbox-poll.h"
 
 typedef struct RAMHTEntry {
     uint32_t handle;
@@ -460,6 +461,7 @@ void *pfifo_thread(void *arg)
     pgraph_init_thread(d);
 
     rcu_register_thread();
+    qemu_thread_set_latency_critical();
 
     qemu_mutex_lock(&d->pfifo.lock);
     while (true) {
@@ -472,6 +474,9 @@ void *pfifo_thread(void *arg)
         }
 
         pgraph_process_pending_reports(d);
+
+        /* The guest may be polling for push buffer progress */
+        xbox_poll_notify();
 
         if (!d->pfifo.fifo_kick) {
             qemu_cond_broadcast(&d->pfifo.fifo_idle_cond);

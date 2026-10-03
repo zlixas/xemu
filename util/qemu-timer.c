@@ -323,6 +323,30 @@ int qemu_timeout_ns_to_ms(int64_t ns)
 /* qemu implementation of g_poll which uses a nanosecond timeout but is
  * otherwise identical to g_poll
  */
+#if defined(XBOX) && defined(__APPLE__) && !defined(CONFIG_PPOLL)
+#include <sys/event.h>
+
+/* Sleep using a one-shot kqueue timer, which is far more precise than
+ * nanosleep on Darwin. On failure (e.g. EINTR) return early; callers spin
+ * for any remaining time.
+ */
+static void precise_sleep_ns(int64_t ns)
+{
+    static __thread int kq = -1;
+    struct kevent ev;
+
+    if (kq < 0) {
+        kq = kqueue();
+        if (kq < 0) {
+            return;
+        }
+    }
+    EV_SET(&ev, 1, EVFILT_TIMER, EV_ADD | EV_ONESHOT,
+           NOTE_NSECONDS | NOTE_CRITICAL, ns, NULL);
+    kevent(kq, &ev, 1, &ev, 1, NULL);
+}
+#endif
+
 int qemu_poll_ns(GPollFD *fds, guint nfds, int64_t timeout)
 {
 #ifdef CONFIG_PPOLL
@@ -348,9 +372,24 @@ int qemu_poll_ns(GPollFD *fds, guint nfds, int64_t timeout)
      * near, to avoid missing deadlines due to costly sleeps.
      */
     #define XBOX_BUSYWAIT_THRESHOLD_NS 1250000
+#ifdef __APPLE__
+    /* Sleep for most of the interval with a precise kqueue timer and only
+     * spin for the remainder. Spinning for the whole threshold kept a core
+     * busy almost constantly, as device timers are rarely more than a
+     * millisecond apart. Measured on M4: NOTE_CRITICAL kqueue timers wake
+     * ~12us late (p99 ~32us), nanosleep ~110us (p99 ~175us).
+     */
+    #define XBOX_BUSYWAIT_SPIN_NS 40000
+#endif
     if ((0 < timeout) && (timeout < XBOX_BUSYWAIT_THRESHOLD_NS)) {
         int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
         int64_t end = now + timeout;
+#ifdef XBOX_BUSYWAIT_SPIN_NS
+        if (timeout > XBOX_BUSYWAIT_SPIN_NS) {
+            precise_sleep_ns(timeout - XBOX_BUSYWAIT_SPIN_NS);
+            now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+        }
+#endif
         while (now < end) {
             now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
         }

@@ -22,4 +22,10 @@ specific_ss.add([volk, libglslang, vma, vulkan, spirv_reflect,
 		)
 	])
 
+if host_os == 'darwin'
+  specific_ss.add(dependency('appleframeworks',
+                             modules: ['CoreFoundation', 'IOSurface', 'OpenGL']),
+                  files('iosurface.c'))
+endif
+
 endif

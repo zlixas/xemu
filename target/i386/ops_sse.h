@@ -468,6 +468,9 @@ void glue(helper_pshufhw, SUFFIX)(Reg *d, Reg *s, int order)
             Reg *d, Reg *v, Reg *s)                                     \
     {                                                                   \
         int i;                                                          \
+        if (SHIFT == 1 && SSE_FAST_PS_ ## name(env, d, v, s)) {         \
+            return;                                                     \
+        }                                                               \
         for (i = 0; i < 2 << SHIFT; i++) {                              \
             d->ZMM_S(i) = F(32, v->ZMM_S(i), s->ZMM_S(i));              \
         }                                                               \

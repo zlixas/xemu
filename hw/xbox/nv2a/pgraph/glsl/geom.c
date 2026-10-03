@@ -86,6 +86,36 @@ bool pgraph_glsl_need_geom(const GeomState *state)
     assert(state->polygon_front_mode == state->polygon_back_mode);
     enum ShaderPolygonMode polygon_mode = state->polygon_front_mode;
 
+    if (state->no_geometry_shader) {
+        /* Best effort without geometry shaders: quads are converted to
+         * triangles and non-fill polygon modes use the pipeline polygon mode.
+         */
+        return false;
+    }
+
+    if (state->fast_depth) {
+        /* Only use the geometry shader where fixed-function GL can't draw the
+         * primitive: quads, non-fill polygon modes and flat shaded polygons.
+         */
+        switch (state->primitive_mode) {
+        case PRIM_TYPE_TRIANGLES:
+        case PRIM_TYPE_TRIANGLE_STRIP:
+        case PRIM_TYPE_TRIANGLE_FAN:
+            return polygon_mode != POLY_MODE_FILL;
+        case PRIM_TYPE_QUADS:
+        case PRIM_TYPE_QUAD_STRIP:
+            return !pgraph_glsl_quads_as_triangles(state);
+        case PRIM_TYPE_POLYGON:
+            if (polygon_mode == POLY_MODE_POINT) {
+                assert(!"POLY_MODE_POINT not supported");
+                return false;
+            }
+            return polygon_mode == POLY_MODE_FILL && !state->smooth_shading;
+        default:
+            return false;
+        }
+    }
+
     switch (state->primitive_mode) {
     case PRIM_TYPE_POINTS:
         return false;
@@ -107,6 +137,67 @@ bool pgraph_glsl_need_geom(const GeomState *state)
     default:
         return false;
     }
+}
+
+bool pgraph_glsl_quads_as_triangles(const GeomState *state)
+{
+    /* Flat shading needs vertex 3 to provoke both triangles of a quad, which
+     * the 0-2 diagonal split cannot express, so it keeps the geometry shader.
+     */
+    if (state->primitive_mode != PRIM_TYPE_QUADS &&
+        state->primitive_mode != PRIM_TYPE_QUAD_STRIP) {
+        return false;
+    }
+    if (state->no_geometry_shader) {
+        return true;
+    }
+    return state->fast_depth &&
+           state->polygon_front_mode == POLY_MODE_FILL &&
+           state->smooth_shading;
+}
+
+size_t pgraph_quads_to_triangles(const GeomState *state,
+                                 const uint32_t *in, uint32_t first,
+                                 size_t count, uint32_t *out)
+{
+#define V(i) (in ? in[i] : first + (uint32_t)(i))
+    enum ShaderPrimitiveMode mode = state->primitive_mode;
+    uint32_t *o = out;
+
+    if (!state->smooth_shading) {
+        /* Flat shading without geometry shader: vertex 3 provokes the whole
+         * quad, so split along the diagonal through it and put it first
+         * (the provoking vertex on hosts like Metal), keeping the winding.
+         */
+        size_t step = mode == PRIM_TYPE_QUADS ? 4 : 2;
+        for (size_t q = 0; q + 4 <= count; q += step) {
+            uint32_t v0 = V(q), v1 = V(q + 1), v2 = V(q + 2), v3 = V(q + 3);
+            if (mode == PRIM_TYPE_QUADS) {
+                *o++ = v3; *o++ = v0; *o++ = v1;
+                *o++ = v3; *o++ = v1; *o++ = v2;
+            } else {
+                *o++ = v3; *o++ = v0; *o++ = v1;
+                *o++ = v3; *o++ = v2; *o++ = v0;
+            }
+        }
+    } else if (mode == PRIM_TYPE_QUADS) {
+        /* Matches the geometry shader: (1, 2, 0), (2, 3, 0) */
+        for (size_t q = 0; q + 4 <= count; q += 4) {
+            uint32_t v0 = V(q), v1 = V(q + 1), v2 = V(q + 2), v3 = V(q + 3);
+            *o++ = v1; *o++ = v2; *o++ = v0;
+            *o++ = v2; *o++ = v3; *o++ = v0;
+        }
+    } else {
+        assert(mode == PRIM_TYPE_QUAD_STRIP);
+        /* Matches the geometry shader: (0, 1, 2), (2, 1, 3) per pair */
+        for (size_t q = 0; q + 4 <= count; q += 2) {
+            uint32_t v0 = V(q), v1 = V(q + 1), v2 = V(q + 2), v3 = V(q + 3);
+            *o++ = v0; *o++ = v1; *o++ = v2;
+            *o++ = v2; *o++ = v1; *o++ = v3;
+        }
+    }
+#undef V
+    return o - out;
 }
 
 MString *pgraph_glsl_gen_geom(const GeomState *state, GenGeomGlslOptions opts)

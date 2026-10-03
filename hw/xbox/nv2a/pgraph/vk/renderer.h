@@ -41,7 +41,17 @@
 #include "constants.h"
 #include "glsl.h"
 
+#ifdef __APPLE__
+/* No GL_EXT_memory_object on macOS: share the display image via IOSurface */
+#define HAVE_EXTERNAL_MEMORY 0
+#define HAVE_IOSURFACE_DISPLAY 1
+#define DISPLAY_VK_FORMAT VK_FORMAT_B8G8R8A8_UNORM
+#else
 #define HAVE_EXTERNAL_MEMORY 1
+#define HAVE_IOSURFACE_DISPLAY 0
+#define DISPLAY_VK_FORMAT VK_FORMAT_R8G8B8A8_UNORM
+#endif
+#define HAVE_GL_DISPLAY (HAVE_EXTERNAL_MEMORY || HAVE_IOSURFACE_DISPLAY)
 
 typedef struct QueueFamilyIndices {
     int queue_family;
@@ -289,6 +299,10 @@ typedef struct PGRAPHVkDisplayState {
     // OpenGL Interop
 #ifdef WIN32
     HANDLE handle;
+#elif HAVE_IOSURFACE_DISPLAY
+    void *iosurface;
+    GLuint gl_rect_texture;
+    GLuint gl_fbo[2];
 #else
     int fd;
 #endif
@@ -324,7 +338,12 @@ typedef struct PGRAPHVkState {
     VkDebugUtilsMessengerEXT debug_messenger;
     int debug_depth;
 
+    /* Scratch space for quad to triangle index conversion */
+    uint32_t *quad_indices;
+    size_t quad_indices_capacity;
+
     bool debug_utils_extension_enabled;
+    bool portability_enumeration_extension_enabled;
     bool custom_border_color_extension_enabled;
     bool memory_budget_extension_enabled;
 
@@ -410,7 +429,7 @@ typedef struct PGRAPHVkState {
     ShaderModuleCacheEntry *shader_module_cache_entries;
 
     // FIXME: Merge these into a structure
-    uint64_t uniform_buffer_hashes[2];
+    ShaderUniformLayout *uniform_buffer_layouts[2];
     size_t uniform_buffer_offsets[2];
     bool uniforms_changed;
 

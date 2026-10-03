@@ -953,20 +953,315 @@ static inline void cpu_loop_exec_tb(CPUState *cpu, TranslationBlock *tb,
 
 /* main execution loop */
 
+/*
+ * XEMU_TCG_STATS diagnostics: per second, count main loop iterations and why
+ * execution left translated code, plus the guest PCs most often resumed at
+ * after an unchainable exit (with surrounding code bytes).
+ */
+#define TCG_STATS_SLOTS 1024
+static struct {
+    int enabled;
+    int64_t ts;
+    uint64_t iters, gen, null_exit, add_jump, page2, irq, exc;
+    struct { vaddr pc; uint32_t count; } pcs[TCG_STATS_SLOTS];
+} tcg_stats = { .enabled = -1 };
+
+static void tcg_stats_record_pc(vaddr pc)
+{
+    unsigned h = (pc * 0x9E3779B1u) % TCG_STATS_SLOTS;
+    for (int i = 0; i < 8; i++) {
+        unsigned j = (h + i) % TCG_STATS_SLOTS;
+        if (tcg_stats.pcs[j].pc == pc || !tcg_stats.pcs[j].count) {
+            tcg_stats.pcs[j].pc = pc;
+            tcg_stats.pcs[j].count++;
+            return;
+        }
+    }
+}
+
+#if defined(__APPLE__) && defined(__aarch64__)
+/*
+ * With XEMU_TCG_STATS=prof, sample the host PC of the vCPU thread on SIGPROF
+ * to find guest code that loops inside chained translated code, which never
+ * shows up as a main loop iteration.
+ */
+#include <signal.h>
+#include <sys/time.h>
+#include <sys/ucontext.h>
+#include <dlfcn.h>
+#include "system/memory.h"
+#define TCG_PROF_SLOTS 4096
+static uintptr_t tcg_prof_pcs[TCG_PROF_SLOTS];
+static uint32_t tcg_prof_regs[TCG_PROF_SLOTS][8];
+static unsigned tcg_prof_n;
+static pthread_t tcg_prof_thread;
+
+static void tcg_prof_handler(int sig, siginfo_t *info, void *uc_)
+{
+    ucontext_t *uc = uc_;
+    if (!pthread_equal(pthread_self(), tcg_prof_thread)) {
+        return;
+    }
+    unsigned n = qatomic_read(&tcg_prof_n);
+    if (n < TCG_PROF_SLOTS) {
+        tcg_prof_pcs[n] = uc->uc_mcontext->__ss.__pc;
+        if (current_cpu) {
+            CPUArchState *env = cpu_env(current_cpu);
+            for (int i = 0; i < 8; i++) {
+                tcg_prof_regs[n][i] = ((uint32_t *)env)[i]; /* i386: regs[] first */
+            }
+        }
+        qatomic_set(&tcg_prof_n, n + 1);
+    }
+}
+
+static void *tcg_prof_kicker(void *opaque)
+{
+    for (;;) {
+        g_usleep(1000);
+        pthread_kill(tcg_prof_thread, SIGPROF);
+    }
+    return NULL;
+}
+
+static void tcg_prof_start(void)
+{
+    struct sigaction sa = { .sa_sigaction = tcg_prof_handler,
+                            .sa_flags = SA_SIGINFO | SA_RESTART };
+    sigset_t set;
+    pthread_t kicker;
+
+    tcg_prof_thread = pthread_self();
+    sigaction(SIGPROF, &sa, NULL);
+    sigemptyset(&set);
+    sigaddset(&set, SIGPROF);
+    pthread_sigmask(SIG_UNBLOCK, &set, NULL);
+    pthread_create(&kicker, NULL, tcg_prof_kicker, NULL);
+}
+
+static int tcg_prof_cmp(const void *a, const void *b)
+{
+    const TranslationBlock *x = *(TranslationBlock * const *)a;
+    const TranslationBlock *y = *(TranslationBlock * const *)b;
+    return x < y ? -1 : x > y;
+}
+
+static void tcg_prof_report(CPUState *cpu)
+{
+    unsigned n = qatomic_read(&tcg_prof_n);
+    TranslationBlock *tbs[TCG_PROF_SLOTS];
+    unsigned in_jit = 0;
+    for (unsigned i = 0; i < n; i++) {
+        tbs[i] = tcg_tb_lookup(tcg_prof_pcs[i]);
+        in_jit += tbs[i] != NULL;
+    }
+    /* Group samples outside translation blocks by host symbol */
+    {
+        struct { const char *sym; unsigned count; } syms[64];
+        int nsyms = 0;
+        for (unsigned i = 0; i < n; i++) {
+            if (tbs[i]) {
+                continue;
+            }
+            Dl_info dli;
+            const char *sym = "?";
+            if (dladdr((void *)tcg_prof_pcs[i], &dli) && dli.dli_sname) {
+                sym = dli.dli_sname;
+            } else if (in_code_gen_buffer((void *)tcg_prof_pcs[i])) {
+                sym = "<jit, no tb>";
+            }
+            int k;
+            for (k = 0; k < nsyms && strcmp(syms[k].sym, sym); k++) {
+            }
+            if (k == nsyms && nsyms < ARRAY_SIZE(syms)) {
+                syms[nsyms].sym = sym;
+                syms[nsyms++].count = 0;
+            }
+            if (k < nsyms) {
+                syms[k].count++;
+            }
+        }
+        for (int t = 0; t < 12; t++) {
+            int best = -1;
+            for (int k = 0; k < nsyms; k++) {
+                if (syms[k].count && (best < 0 || syms[k].count > syms[best].count)) {
+                    best = k;
+                }
+            }
+            if (best < 0) {
+                break;
+            }
+            fprintf(stderr, "tcgprof:   host %4.1f%% %s\n",
+                    syms[best].count * 100.0 / n, syms[best].sym);
+            syms[best].count = 0;
+        }
+    }
+    /* Hottest raw host PCs, with their TB if any */
+    {
+        uintptr_t pcs[TCG_PROF_SLOTS];
+        memcpy(pcs, tcg_prof_pcs, n * sizeof(pcs[0]));
+        qsort(pcs, n, sizeof(pcs[0]), tcg_prof_cmp);
+        for (int t = 0; t < 4; t++) {
+            uintptr_t bestpc = 0;
+            unsigned bestc = 0;
+            for (unsigned i = 0; i < n;) {
+                unsigned j = i;
+                while (j < n && pcs[j] == pcs[i]) {
+                    j++;
+                }
+                if (pcs[i] && j - i > bestc) {
+                    bestc = j - i;
+                    bestpc = pcs[i];
+                }
+                i = j;
+            }
+            if (!bestc) {
+                break;
+            }
+            TranslationBlock *tb = tcg_tb_lookup(bestpc);
+            fprintf(stderr, "tcgprof:   hostpc %lx %4.1f%% tb=%p jit=%d\n",
+                    (unsigned long)bestpc, bestc * 100.0 / n, tb,
+                    in_code_gen_buffer((void *)bestpc));
+            for (unsigned i = 0; i < n; i++) {
+                if (pcs[i] == bestpc) {
+                    pcs[i] = 0;
+                }
+            }
+        }
+    }
+    qsort(tbs, n, sizeof(tbs[0]), tcg_prof_cmp);
+    fprintf(stderr, "tcgprof: %u samples, %u in translated code\n", n, in_jit);
+    for (int k = 0; k < 6; k++) {
+        TranslationBlock *best = NULL;
+        unsigned best_count = 0;
+        for (unsigned i = 0; i < n;) {
+            unsigned j = i;
+            while (j < n && tbs[j] == tbs[i]) {
+                j++;
+            }
+            if (tbs[i] && j - i > best_count) {
+                best = tbs[i];
+                best_count = j - i;
+            }
+            i = j;
+        }
+        if (!best) {
+            break;
+        }
+        uint8_t code[48];
+        tb_page_addr_t phys = tb_page_addr0(best);
+        fprintf(stderr, "tcgprof:   %4.1f%% tb phys=%08" PRIx64 " size=%u icount=%u flags=%x bytes=",
+                best_count * 100.0 / n, (uint64_t)phys, best->size,
+                tb_cflags(best) & CF_COUNT_MASK, best->flags);
+        memcpy(code, qemu_map_ram_ptr(NULL, phys), MIN(sizeof(code), best->size));
+        for (int i = 0; i < (int)MIN(sizeof(code), best->size); i++) {
+            fprintf(stderr, "%02x", code[i]);
+        }
+        fprintf(stderr, "\n");
+        for (unsigned i = 0; i < n; i++) {
+            if (tcg_tb_lookup(tcg_prof_pcs[i]) == best) {
+                uint32_t *rg = tcg_prof_regs[i];
+                uint32_t mem = 0;
+                cpu_memory_rw_debug(cpu, rg[2], &mem, 4, false);
+                fprintf(stderr, "tcgprof:     eax=%08x ecx=%08x edx=%08x ebx=%08x esp=%08x ebp=%08x esi=%08x edi=%08x [edx]=%08x\n",
+                        rg[0], rg[1], rg[2], rg[3], rg[4], rg[5], rg[6], rg[7], mem);
+                break;
+            }
+        }
+        for (unsigned i = 0; i < n; i++) {
+            if (tbs[i] == best) {
+                tbs[i] = NULL;
+            }
+        }
+    }
+    qatomic_set(&tcg_prof_n, 0);
+}
+#else
+static void tcg_prof_start(void) {}
+static void tcg_prof_report(CPUState *cpu) {}
+#endif
+
+static void tcg_stats_report(CPUState *cpu)
+{
+    int64_t now = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+    double secs = (now - tcg_stats.ts) / 1e6;
+    if (secs < 1.0) {
+        return;
+    }
+    tcg_prof_report(cpu);
+    fprintf(stderr, "tcg: iters=%.0f/s gen=%.0f/s null_exit=%.0f/s "
+            "add_jump=%.0f/s page2=%.0f/s irq=%.0f/s exc=%.0f/s\n",
+            tcg_stats.iters / secs, tcg_stats.gen / secs,
+            tcg_stats.null_exit / secs, tcg_stats.add_jump / secs,
+            tcg_stats.page2 / secs, tcg_stats.irq / secs,
+            tcg_stats.exc / secs);
+    for (int n = 0; n < 6; n++) {
+        int best = -1;
+        for (int i = 0; i < TCG_STATS_SLOTS; i++) {
+            if (tcg_stats.pcs[i].count &&
+                (best < 0 || tcg_stats.pcs[i].count > tcg_stats.pcs[best].count)) {
+                best = i;
+            }
+        }
+        if (best < 0) {
+            break;
+        }
+        uint8_t code[32];
+        vaddr pc = tcg_stats.pcs[best].pc;
+        fprintf(stderr, "tcg:   resume pc=%08" VADDR_PRIx " %.0f/s bytes[-24..+8]=",
+                pc, tcg_stats.pcs[best].count / secs);
+        if (cpu_memory_rw_debug(cpu, pc - 24, code, sizeof(code), false) == 0) {
+            for (int i = 0; i < (int)sizeof(code); i++) {
+                fprintf(stderr, "%02x", code[i]);
+            }
+        }
+        fprintf(stderr, "\n");
+        tcg_stats.pcs[best].count = 0;
+    }
+    memset(tcg_stats.pcs, 0, sizeof(tcg_stats.pcs));
+    tcg_stats.iters = tcg_stats.gen = tcg_stats.null_exit = 0;
+    tcg_stats.add_jump = tcg_stats.page2 = tcg_stats.irq = tcg_stats.exc = 0;
+    tcg_stats.ts = now;
+}
+
 static int __attribute__((noinline))
 cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
 {
     int ret;
 
+    if (tcg_stats.enabled < 0) {
+        const char *env = getenv("XEMU_TCG_STATS");
+        tcg_stats.enabled = env != NULL;
+        tcg_stats.ts = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+        if (env && !strcmp(env, "prof")) {
+            tcg_prof_start();
+        }
+    }
+
     /* if an exception is pending, we execute it here */
     while (!cpu_handle_exception(cpu, &ret)) {
         TranslationBlock *last_tb = NULL;
         int tb_exit = 0;
+        bool stats = tcg_stats.enabled;
+        bool prev_null_exit = false;
+
+        if (stats) {
+            tcg_stats.exc++;
+        }
 
         while (!cpu_handle_interrupt(cpu, &last_tb)) {
             TranslationBlock *tb;
             TCGTBCPUState s = cpu->cc->tcg_ops->get_tb_cpu_state(cpu);
             s.cflags = cpu->cflags_next_tb;
+
+            if (stats) {
+                if ((++tcg_stats.iters & 0xFFFF) == 0) {
+                    tcg_stats_report(cpu);
+                }
+                if (prev_null_exit) {
+                    tcg_stats_record_pc(s.pc);
+                }
+            }
 
             /*
              * When requested, use an exact setting for cflags for the next
@@ -993,6 +1288,9 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
                 mmap_lock();
                 tb = tb_gen_code(cpu, s);
                 mmap_unlock();
+                if (stats) {
+                    tcg_stats.gen++;
+                }
 
                 /*
                  * We add the TB in the virtual pc hash table
@@ -1012,15 +1310,26 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
              * for the second page can change.
              */
             if (tb_page_addr1(tb) != -1) {
+                if (stats && last_tb) {
+                    tcg_stats.page2++;
+                }
                 last_tb = NULL;
             }
 #endif
             /* See if we can patch the calling TB. */
             if (last_tb) {
+                if (stats) {
+                    tcg_stats.add_jump++;
+                }
                 tb_add_jump(last_tb, tb_exit, tb);
             }
 
             cpu_loop_exec_tb(cpu, tb, s.pc, &last_tb, &tb_exit);
+
+            if (stats) {
+                prev_null_exit = last_tb == NULL;
+                tcg_stats.null_exit += prev_null_exit;
+            }
 
             /* Try to align the host and virtual clocks
                if the guest is in advance */

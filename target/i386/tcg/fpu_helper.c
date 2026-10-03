@@ -3506,6 +3506,21 @@ void helper_emms(CPUX86State *env)
     *(uint32_t *)(env->fptags + 4) = 0x01010101;
 }
 
+/* Packed single add/sub/mul vector fast path, see sse-fast.h */
+#include "sse-fast.h"
+#define SSE_FAST_PS_add(env, d, v, s) \
+    sse_fast_ps(&(env)->sse_status, &(d)->ZMM_L(0), &(v)->ZMM_L(0), \
+                &(s)->ZMM_L(0), SSE_FAST_ADD)
+#define SSE_FAST_PS_sub(env, d, v, s) \
+    sse_fast_ps(&(env)->sse_status, &(d)->ZMM_L(0), &(v)->ZMM_L(0), \
+                &(s)->ZMM_L(0), SSE_FAST_SUB)
+#define SSE_FAST_PS_mul(env, d, v, s) \
+    sse_fast_ps(&(env)->sse_status, &(d)->ZMM_L(0), &(v)->ZMM_L(0), \
+                &(s)->ZMM_L(0), SSE_FAST_MUL)
+#define SSE_FAST_PS_div(env, d, v, s) false
+#define SSE_FAST_PS_min(env, d, v, s) false
+#define SSE_FAST_PS_max(env, d, v, s) false
+
 #define SHIFT 0
 #include "ops_sse.h"
 

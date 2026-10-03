@@ -237,6 +237,9 @@ display:
     surface_scale:
       type: integer
       default: 1
+    fast_depth:
+      type: bool
+      default: true
   filtering:
     type: enum
     values: [linear, nearest]

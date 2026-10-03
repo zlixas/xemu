@@ -8,6 +8,7 @@ from urllib.request import Request, urlopen
 import gzip
 import re
 import os.path
+import tarfile
 from tarfile import TarFile
 import subprocess
 
@@ -140,7 +141,12 @@ class LibInstaller:
 			assert extracted_path.startswith(self._extract_path), f'tarball has a global file: {fname}'
 
 		print(f'    [*] Extracting to {self._extract_path}')
-		tb.extractall(self._extract_path, numeric_owner=True)
+		# Python 3.14 defaults to the 'data' filter, which rejects the absolute
+		# symlinks some packages ship; file paths are validated above.
+		if hasattr(tarfile, 'tar_filter'):
+			tb.extractall(self._extract_path, numeric_owner=True, filter='tar')
+		else:
+			tb.extractall(self._extract_path, numeric_owner=True)
 
 		for fpath in tb.getnames():
 			# FIXME: Symlinks

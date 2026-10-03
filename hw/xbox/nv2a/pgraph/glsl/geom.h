@@ -32,6 +32,8 @@ typedef struct {
     bool smooth_shading;
     bool first_vertex_is_provoking;
     bool z_perspective;
+    bool fast_depth;
+    bool no_geometry_shader;
     short tri_rot0;
     short tri_rot1;
 } GeomState;
@@ -43,6 +45,31 @@ typedef struct GenGeomGlslOptions {
 void pgraph_glsl_set_geom_state(PGRAPHState *pg, GeomState *geom);
 
 bool pgraph_glsl_need_geom(const GeomState *state);
+
+/*
+ * True when quads/quad strips are drawn as indexed triangle lists instead of
+ * through the geometry shader (fast depth, fill mode, smooth shading).
+ */
+bool pgraph_glsl_quads_as_triangles(const GeomState *state);
+
+/* Upper bound of triangle list indices for count quad (strip) vertices */
+static inline size_t pgraph_quad_tri_index_count(enum ShaderPrimitiveMode mode,
+                                                 size_t count)
+{
+    if (mode == PRIM_TYPE_QUADS) {
+        return count / 4 * 6;
+    }
+    return count >= 4 ? (count - 2) / 2 * 6 : 0;
+}
+
+/*
+ * Convert count quad (strip) vertices to triangle list indices, using the
+ * same split and winding as the geometry shader. Vertex i is in[i] if in is
+ * not NULL, otherwise first + i. Returns the number of indices written.
+ */
+size_t pgraph_quads_to_triangles(const GeomState *state,
+                                 const uint32_t *in, uint32_t first,
+                                 size_t count, uint32_t *out);
 
 MString *pgraph_glsl_gen_geom(const GeomState *state, GenGeomGlslOptions opts);
 
