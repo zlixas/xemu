@@ -33,6 +33,10 @@
 
 static const char *hw_version = QEMU_HW_VERSION;
 
+#ifdef __APPLE__
+__thread int8_t qemu_jit_execute_state = -1;
+#endif
+
 int socket_set_cork(int fd, int v)
 {
 #if defined(SOL_TCP) && defined(TCP_CORK)

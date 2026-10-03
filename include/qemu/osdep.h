@@ -858,14 +858,27 @@ size_t qemu_get_host_physmem(void);
  * for the current thread.
  */
 #ifdef __APPLE__
+/*
+ * MAP_JIT protection of the current thread: -1 unknown, 0 write, 1 execute.
+ * pthread_jit_write_protect_np() is costly and cpu_tb_exec() requests execute
+ * permission for every translation block run, so skip redundant toggles.
+ */
+extern __thread int8_t qemu_jit_execute_state;
+
 static inline void qemu_thread_jit_execute(void)
 {
-    pthread_jit_write_protect_np(true);
+    if (qemu_jit_execute_state != 1) {
+        pthread_jit_write_protect_np(true);
+        qemu_jit_execute_state = 1;
+    }
 }
 
 static inline void qemu_thread_jit_write(void)
 {
-    pthread_jit_write_protect_np(false);
+    if (qemu_jit_execute_state != 0) {
+        pthread_jit_write_protect_np(false);
+        qemu_jit_execute_state = 0;
+    }
 }
 #else
 static inline void qemu_thread_jit_write(void) {}

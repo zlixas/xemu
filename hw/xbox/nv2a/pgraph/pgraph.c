@@ -22,6 +22,7 @@
 #include <math.h>
 
 #include "hw/xbox/nv2a/nv2a_int.h"
+#include "qemu/xbox-poll.h"
 #include "ui/xemu-notifications.h"
 #include "ui/xemu-settings.h"
 #include "util.h"
@@ -376,6 +377,9 @@ void nv2a_release_framebuffer_surface(void)
     NV2AState *d = g_nv2a;
     PGRAPHState *pg = &d->pgraph;
     qemu_mutex_lock(&pg->renderer_lock);
+    if (pg->renderer->ops.release_framebuffer_surface) {
+        pg->renderer->ops.release_framebuffer_surface(d);
+    }
     pg->framebuffer_in_use = false;
     qemu_cond_broadcast(&pg->framebuffer_released);
     qemu_mutex_unlock(&pg->renderer_lock);
@@ -521,6 +525,12 @@ static void pgraph_method_log(unsigned int subchannel,
     const char *method_name = "?";
     static unsigned int last = 0;
     static unsigned int count = 0;
+
+    /* Called for every method, skip the name lookups unless tracing */
+    if (!trace_event_get_state(TRACE_NV2A_PGRAPH_METHOD) &&
+        !trace_event_get_state(TRACE_NV2A_PGRAPH_METHOD_ABBREV)) {
+        return;
+    }
 
     if (last == NV097_ARRAY_ELEMENT16 && method != last) {
         method_name = "NV097_ARRAY_ELEMENT16";
@@ -2859,6 +2869,7 @@ DEF_METHOD(NV097, BACK_END_WRITE_SEMAPHORE_RELEASE)
     semaphore_data += semaphore_offset;
 
     stl_le_p((uint32_t*)semaphore_data, parameter);
+    xbox_poll_notify();
 
     //qemu_mutex_lock(&d->pgraph.lock);
     //bql_unlock();
@@ -3157,6 +3168,7 @@ void pgraph_write_zpass_pixel_cnt_report(NV2AState *d, uint32_t parameter,
     stq_le_p((uint64_t *)&report_data[0], timestamp);
     stl_le_p((uint32_t *)&report_data[8], result);
     stl_le_p((uint32_t *)&report_data[12], done);
+    xbox_poll_notify();
 
     NV2A_DPRINTF("Report result %d @%" HWADDR_PRIx, result, offset);
 }

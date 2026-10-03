@@ -785,7 +785,14 @@ static void *vblank_timer_thread(void *opaque)
         // Wait until deadline
         int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
         if (now < next_vblank) {
+#ifdef __APPLE__
+            /* SDL_DelayPrecise wakes every millisecond and spins the last
+             * one; a single Darwin sleep is accurate enough for vblank.
+             */
+            SDL_DelayNS(next_vblank - now);
+#else
             SDL_DelayPrecise(next_vblank - now);
+#endif
         } else if (now > next_vblank + vblank_interval_ns) {
             // We've fallen behind by more than one frame, reset to avoid
             // rapid-fire catch-up
@@ -883,7 +890,9 @@ static void gl_render_frame(struct xemu_console *scon)
     xemu_main_loop_unlock();
 
     xemu_hud_render();
+#ifndef __APPLE__
     glFinish();
+#endif
 
     if (release_surface_texture) {
         xemu_main_loop_lock();
@@ -1435,6 +1444,17 @@ int main(int argc, char **argv)
     struct xemu_console *scon = &scon_list[0];
     while (!qatomic_read(&qemu_exiting)) {
         poll_events(scon);
+
+        /* Skip rendering while nothing is visible. Swaps aren't throttled by
+         * vsync for hidden windows (notably on macOS), so this loop would
+         * otherwise spin at full speed.
+         */
+        if (SDL_GetWindowFlags(scon->real_window) &
+            (SDL_WINDOW_HIDDEN | SDL_WINDOW_MINIMIZED | SDL_WINDOW_OCCLUDED)) {
+            SDL_DelayNS(vblank_interval_ns);
+            continue;
+        }
+
         gl_render_frame(scon);
     }
     qemu_sem_post(&display_shutdown_sem);

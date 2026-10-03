@@ -92,6 +92,10 @@ DEF_HELPER_1(stgi, void, env)
 DEF_HELPER_1(clgi, void, env)
 DEF_HELPER_FLAGS_2(flush_page, TCG_CALL_NO_RWG, void, env, tl)
 DEF_HELPER_FLAGS_1(hlt, TCG_CALL_NO_WG, noreturn, env)
+#ifdef XBOX
+DEF_HELPER_1(xbox_idle, void, env)
+DEF_HELPER_2(xbox_poll, void, env, i32)
+#endif
 DEF_HELPER_FLAGS_2(monitor, TCG_CALL_NO_WG, void, env, tl)
 DEF_HELPER_FLAGS_2(mwait, TCG_CALL_NO_WG, noreturn, env, int)
 DEF_HELPER_1(rdmsr, void, env)

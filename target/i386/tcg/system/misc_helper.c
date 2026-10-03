@@ -18,6 +18,8 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/xbox-poll.h"
+#include "qemu/timer.h"
 #include "qemu/main-loop.h"
 #include "cpu.h"
 #include "exec/helper-proto.h"
@@ -510,6 +512,84 @@ void helper_flush_page(CPUX86State *env, target_ulong addr)
 {
     tlb_flush_page(env_cpu(env), addr);
 }
+
+#ifdef XBOX
+/*
+ * The Xbox kernel idle loop (KiIdleLoop) never halts:
+ *
+ *       sti
+ *       nop
+ *   P:  nop
+ *       cli
+ *       cmp   ebp, [ebp]            ; DPC list (Prcb+50h) empty?
+ *       je    1f
+ *       ...retire DPCs...
+ *   1:  cmp   dword [ebx+2Ch], 0    ; Prcb->NextThread
+ *       je    <sti>
+ *
+ * Each sti ends a TB, so the loop exits translated code tens of millions of
+ * times per second and keeps a host core fully busy whenever the game waits.
+ * Only an interrupt handler can queue a DPC or ready a thread on the single
+ * processor Xbox, so with both checks failing, halting at P until the next
+ * interrupt is equivalent to spinning. Called at the start of the TB at P.
+ */
+void helper_xbox_idle(CPUX86State *env)
+{
+    CPUState *cs = env_cpu(env);
+    uint32_t ebp = env->regs[R_EBP], ebx = env->regs[R_EBX];
+    uint32_t dpc_flink, next_thread;
+
+    if (!(env->eflags & IF_MASK) || (env->hflags & HF_INHIBIT_IRQ_MASK)) {
+        return;
+    }
+    if (cpu_memory_rw_debug(cs, ebp, &dpc_flink, 4, false) ||
+        cpu_memory_rw_debug(cs, ebx + 0x2c, &next_thread, 4, false)) {
+        return;
+    }
+    if (le32_to_cpu(dpc_flink) != ebp || next_thread != 0) {
+        return;
+    }
+
+    cs->halted = 1;
+    cs->exception_index = EXCP_HLT;
+    cpu_loop_exit(cs);
+}
+
+/*
+ * Called at the start of each iteration of a guest polling loop: a short
+ * loop that only reads memory and compares until a value changes, typically
+ * waiting for the GPU (see is_xbox_poll_loop). After the loop has spun for a
+ * while, sleep until device emulation makes progress or the vCPU is kicked
+ * (interrupts), instead of keeping a host core busy. The loop re-checks its
+ * condition after every wakeup, so this only changes timing.
+ */
+#define XBOX_POLL_SPIN_NS  20000   /* spin this long before sleeping */
+#define XBOX_POLL_GAP_NS   50000   /* longer gaps start a new poll */
+#define XBOX_POLL_SLEEP_NS 250000  /* fallback wakeup */
+
+void helper_xbox_poll(CPUX86State *env, uint32_t pc)
+{
+    static __thread uint32_t poll_pc;
+    static __thread int64_t poll_start, poll_last;
+    CPUState *cs = env_cpu(env);
+    int64_t now = get_clock();
+
+    if (pc != poll_pc || now - poll_last > XBOX_POLL_GAP_NS) {
+        poll_pc = pc;
+        poll_start = now;
+    }
+    poll_last = now;
+
+    if (now - poll_start < XBOX_POLL_SPIN_NS ||
+        qatomic_read(&cs->exit_request) ||
+        qatomic_read(&cs->interrupt_request)) {
+        return;
+    }
+
+    xbox_poll_wait(XBOX_POLL_SLEEP_NS);
+    poll_last = get_clock();
+}
+#endif
 
 G_NORETURN void helper_hlt(CPUX86State *env)
 {

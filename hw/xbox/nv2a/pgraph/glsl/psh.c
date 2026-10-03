@@ -1001,7 +1001,26 @@ static MString* psh_convert(struct PixelShader *ps)
                              "}\n");
     }
 
-    if (ps->state->z_perspective) {
+    if (ps->state->fast_depth) {
+        /* Fixed-function interpolated depth, no geometry shader inputs */
+        if (ps->state->z_perspective) {
+            mstring_append(clip,
+                           "float zvalue = 1.0/gl_FragCoord.w + depthOffset;\n");
+        } else if (ps->opts.vulkan) {
+            mstring_append(clip, "float zvalue = gl_FragCoord.z*clipRange.y;\n");
+        } else {
+            /* Tolerate GL [-1,1] NDC imprecision at the clip range bounds,
+             * e.g. MS dashboard renders z=0.0 with clip range [0.0, 0.0].
+             */
+            mstring_append(clip, "float zvalue = gl_FragCoord.z*clipRange.y;\n"
+                                 "float ztol = clipRange.y/16777216.0;\n"
+                                 "if (zvalue < clipRange.z && zvalue >= clipRange.z - ztol) {\n"
+                                 "  zvalue = clipRange.z;\n"
+                                 "} else if (zvalue > clipRange.w && zvalue <= clipRange.w + ztol) {\n"
+                                 "  zvalue = clipRange.w;\n"
+                                 "}\n");
+        }
+    } else if (ps->state->z_perspective) {
         mstring_append(
             clip,
             "vec2 unscaled_xy = gl_FragCoord.xy / surfaceScale;\n"
@@ -1498,7 +1517,18 @@ static MString* psh_convert(struct PixelShader *ps)
      * due to rounding.)
      */
 
-    switch (ps->state->depth_format) {
+    if (ps->state->fast_depth) {
+        if (ps->state->z_perspective) {
+            mstring_append(ps->code,
+                           "gl_FragDepth = clamp(zvalue, clipRange.z, clipRange.w)/clipRange.y;\n");
+        } else if (!ps->state->depth_clipping) {
+            mstring_append(ps->code,
+                           "gl_FragDepth = clamp(gl_FragCoord.z, clipRange.z/clipRange.y, clipRange.w/clipRange.y);\n");
+        }
+        /* Otherwise leave depth to fixed function, which keeps early depth
+         * testing / hidden surface removal enabled.
+         */
+    } else switch (ps->state->depth_format) {
     case DEPTH_FORMAT_D16:
         // 16-bit unsigned int
         mstring_append(

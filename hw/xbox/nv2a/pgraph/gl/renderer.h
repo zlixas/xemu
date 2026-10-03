@@ -107,6 +107,12 @@ typedef struct ShaderModuleCacheEntry {
     GLuint gl_shader;
 } ShaderModuleCacheEntry;
 
+/* Uniform values last uploaded to a program, for skipping redundant uploads */
+typedef struct ShaderUniformCache {
+    VshUniformValues vsh;
+    PshUniformValues psh;
+} ShaderUniformCache;
+
 typedef struct ShaderBinding {
     LruNode node;
     bool initialized;
@@ -120,11 +126,16 @@ typedef struct ShaderBinding {
 
     GLuint gl_program;
     GLenum gl_primitive_mode;
+    /* Quads are drawn as GL_TRIANGLES via converted indices */
+    bool quads_as_triangles;
 
     struct {
         PshUniformLocs psh;
         VshUniformLocs vsh;
     } uniform_locs;
+
+    /* NULL until uniforms are first uploaded to gl_program */
+    ShaderUniformCache *uniform_cache;
 } ShaderBinding;
 
 typedef struct VertexKey {
@@ -167,9 +178,41 @@ typedef struct QueryReport {
     GLuint *queries;
 } QueryReport;
 
+/*
+ * glEnable/glDisable capabilities toggled per draw in the render context.
+ * These are shadowed so that redundant toggles are not sent to the driver,
+ * which is costly on macOS where GL is layered on Metal.
+ */
+#define PGRAPH_GL_CAPS(X) \
+    X(BLEND)               \
+    X(CULL_FACE)           \
+    X(DEPTH_CLAMP)         \
+    X(DEPTH_TEST)          \
+    X(DITHER)              \
+    X(LINE_SMOOTH)         \
+    X(POLYGON_OFFSET_FILL) \
+    X(POLYGON_OFFSET_LINE) \
+    X(POLYGON_OFFSET_POINT)\
+    X(POLYGON_SMOOTH)      \
+    X(PROGRAM_POINT_SIZE)  \
+    X(SCISSOR_TEST)        \
+    X(STENCIL_TEST)
+
+enum PGRAPHGLCap {
+#define X(n) PGRAPH_GL_CAP_##n,
+    PGRAPH_GL_CAPS(X)
+#undef X
+    PGRAPH_GL_CAP__COUNT
+};
+
 typedef struct PGRAPHGLState {
+    /* Shadowed cap state: -1 unknown, 0 disabled, 1 enabled */
+    int8_t gl_caps[PGRAPH_GL_CAP__COUNT];
+
     GLuint gl_framebuffer;
     GLuint gl_display_buffer;
+    GLsync display_fence; /* display buffer written, waited on by the UI */
+    GLsync ui_fence; /* UI done sampling display buffer */
     GLint gl_display_buffer_internal_format;
     GLsizei gl_display_buffer_width;
     GLsizei gl_display_buffer_height;
@@ -178,6 +221,10 @@ typedef struct PGRAPHGLState {
 
     Lru element_cache;
     VertexLruNode *element_cache_entries;
+
+    /* Scratch space for quad to triangle index conversion */
+    uint32_t *quad_indices;
+    size_t quad_indices_capacity;
     GLuint gl_inline_array_buffer;
     GLuint gl_memory_buffer;
     GLuint gl_vertex_array;
@@ -291,6 +338,36 @@ void pgraph_gl_shader_write_cache_reload_list(PGRAPHState *pg);
 void pgraph_gl_set_surface_scale_factor(NV2AState *d, unsigned int scale);
 unsigned int pgraph_gl_get_surface_scale_factor(NV2AState *d);
 int pgraph_gl_get_framebuffer_surface(NV2AState *d);
+void pgraph_gl_release_framebuffer_surface(NV2AState *d);
+static inline void pgraph_gl_invalidate_caps(PGRAPHGLState *r)
+{
+    memset(r->gl_caps, -1, sizeof(r->gl_caps));
+}
+
+static inline void pgraph_gl_set_cap_idx(PGRAPHGLState *r, enum PGRAPHGLCap idx,
+                                         bool enable)
+{
+    static const GLenum caps[] = {
+#define X(n) GL_##n,
+        PGRAPH_GL_CAPS(X)
+#undef X
+    };
+
+    if (r->gl_caps[idx] == enable) {
+        return;
+    }
+    r->gl_caps[idx] = enable;
+    if (enable) {
+        glEnable(caps[idx]);
+    } else {
+        glDisable(caps[idx]);
+    }
+}
+
+/* Enable or disable a render context cap, e.g. pgraph_gl_set_cap(r, BLEND, true) */
+#define pgraph_gl_set_cap(r, name, enable) \
+    pgraph_gl_set_cap_idx((r), PGRAPH_GL_CAP_##name, (enable))
+
 /**  Note: The caller must set up a clean GL context before invoking. */
 void pgraph_gl_determine_gpu_properties(void);
 GPUProperties *pgraph_gl_get_gpu_properties(void);

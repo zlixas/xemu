@@ -39,11 +39,55 @@ void nv2a_profile_increment(void)
     }
 }
 
+/*
+ * With XEMU_PERF_LOG set, print frames per second and per-frame averages of
+ * the nonzero profile counters once a second to stderr.
+ */
+static void perf_log_frame(int64_t now)
+{
+    static int enabled = -1;
+    static int64_t ts;
+    static unsigned int frames;
+    static int64_t sums[NV2A_PROF__COUNT];
+
+    if (enabled < 0) {
+        enabled = getenv("XEMU_PERF_LOG") != NULL;
+        ts = now;
+    }
+    if (!enabled) {
+        return;
+    }
+
+    frames++;
+    for (int i = 0; i < NV2A_PROF__COUNT; i++) {
+        sums[i] += g_nv2a_stats.frame_working.counters[i];
+    }
+
+    int64_t delta = now - ts;
+    if (delta < 1000000) {
+        return;
+    }
+
+    fprintf(stderr, "perf: fps=%.1f", frames * 1000000.0 / delta);
+    for (int i = 0; i < NV2A_PROF__COUNT; i++) {
+        if (sums[i]) {
+            fprintf(stderr, " %s=%.1f", nv2a_profile_get_counter_name(i),
+                    (double)sums[i] / frames);
+        }
+    }
+    fprintf(stderr, "\n");
+
+    ts = now;
+    frames = 0;
+    memset(sums, 0, sizeof(sums));
+}
+
 void nv2a_profile_flip_stall(void)
 {
     int64_t now = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
     int64_t render_time = (now-g_nv2a_stats.last_flip_time)/1000;
 
+    perf_log_frame(now);
     g_nv2a_stats.frame_working.mspf = render_time;
     g_nv2a_stats.frame_history[g_nv2a_stats.frame_ptr] =
         g_nv2a_stats.frame_working;

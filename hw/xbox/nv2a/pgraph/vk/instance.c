@@ -22,6 +22,10 @@
 #include "renderer.h"
 #include "xemu-version.h"
 
+#ifdef __APPLE__
+#include <dlfcn.h>
+#endif
+
 #define VkExtensionPropertiesArray GArray
 #define StringArray GArray
 
@@ -35,6 +39,9 @@ static char const *const required_device_extensions[] = {
 #ifdef WIN32
     VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME,
     VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME,
+#elif defined(__APPLE__)
+    /* Display images are shared with GL through IOSurfaces */
+    VK_EXT_METAL_OBJECTS_EXTENSION_NAME,
 #else
     VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
     VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME,
@@ -142,14 +149,60 @@ add_optional_instance_extension_names(PGRAPHState *pg,
         g_config.display.vulkan.validation_layers &&
         add_extension_if_available(available_extensions, enabled_extension_names,
                                    VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+
+    /* Needed to enumerate non-conformant implementations like MoltenVK
+     * through the Vulkan loader. */
+    r->portability_enumeration_extension_enabled =
+        is_extension_available(available_extensions,
+                               VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME) &&
+        add_extension_if_available(available_extensions, enabled_extension_names,
+                                   VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
 }
+
+#ifdef __APPLE__
+/*
+ * Load MoltenVK directly: from the app bundle first, then from Homebrew. This
+ * avoids depending on a Vulkan loader and ICD manifest being installed.
+ */
+static VkResult load_vulkan_library(void)
+{
+    static const char *const paths[] = {
+        "@executable_path/../Libraries/arm64/libMoltenVK.dylib",
+        "@executable_path/../Frameworks/libMoltenVK.dylib",
+        "@executable_path/libMoltenVK.dylib",
+        "/opt/homebrew/lib/libMoltenVK.dylib",
+        "/usr/local/lib/libMoltenVK.dylib",
+    };
+
+    for (int i = 0; i < ARRAY_SIZE(paths); i++) {
+        void *module = dlopen(paths[i], RTLD_NOW | RTLD_LOCAL);
+        if (!module) {
+            continue;
+        }
+        PFN_vkGetInstanceProcAddr get_instance_proc_addr =
+            (PFN_vkGetInstanceProcAddr)dlsym(module, "vkGetInstanceProcAddr");
+        if (get_instance_proc_addr) {
+            fprintf(stderr, "Loaded Vulkan implementation: %s\n", paths[i]);
+            volkInitializeCustom(get_instance_proc_addr);
+            return VK_SUCCESS;
+        }
+        dlclose(module);
+    }
+
+    return volkInitialize();
+}
+#endif
 
 static bool create_instance(PGRAPHState *pg, Error **errp)
 {
     PGRAPHVkState *r = pg->vk_renderer_state;
     VkResult result;
 
+#ifdef __APPLE__
+    result = load_vulkan_library();
+#else
     result = volkInitialize();
+#endif
     if (result != VK_SUCCESS) {
         error_setg(errp, "volkInitialize failed");
         return false;
@@ -195,6 +248,9 @@ static bool create_instance(PGRAPHState *pg, Error **errp)
 
     VkInstanceCreateInfo create_info = {
         .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
+        .flags = r->portability_enumeration_extension_enabled ?
+                     VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR :
+                     0,
         .pApplicationInfo = &app_info,
         .enabledExtensionCount = enabled_extension_names->len,
         .ppEnabledExtensionNames =
@@ -331,6 +387,14 @@ static void add_optional_device_extension_names(
     r->memory_budget_extension_enabled = add_extension_if_available(
         available_extensions, enabled_extension_names,
         VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+
+    /* Must be enabled when supported (e.g. MoltenVK) */
+    if (is_extension_available(available_extensions,
+                               VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME)) {
+        add_extension_if_available(available_extensions,
+                                   enabled_extension_names,
+                                   VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME);
+    }
 }
 
 static bool check_device_support_required_extensions(VkPhysicalDevice device)
@@ -489,7 +553,13 @@ static bool create_logical_device(PGRAPHState *pg, Error **errp)
         }
         F(depthClamp, true),
         F(fillModeNonSolid, true),
+#ifdef __APPLE__
+        /* Metal has no geometry shaders: fast depth and quad conversion
+         * replace them. */
+        F(geometryShader, false),
+#else
         F(geometryShader, true),
+#endif
         F(occlusionQueryPrecise, true),
         F(samplerAnisotropy, false),
         F(shaderClipDistance, true),

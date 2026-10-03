@@ -425,19 +425,22 @@ static ShaderBinding *get_shader_binding_for_state(PGRAPHVkState *r,
     return binding;
 }
 
-static void apply_uniform_updates(ShaderUniformLayout *layout,
+/* Returns whether any uniform value changed */
+static bool apply_uniform_updates(ShaderUniformLayout *layout,
                                   const UniformInfo *info, int *locs,
                                   void *values, size_t count)
 {
+    bool changed = false;
     for (int i = 0; i < count; i++) {
         if (locs[i] != -1) {
-            uniform_copy(layout, locs[i], (char*)values + info[i].val_offs,
-                         4, (info[i].size * info[i].count) / 4);
+            changed |= uniform_copy_if_changed(
+                layout, locs[i], (char *)values + info[i].val_offs, 4,
+                (info[i].size * info[i].count) / 4);
         }
     }
+    return changed;
 }
 
-// FIXME: Dirty tracking
 static void update_shader_uniforms(PGRAPHState *pg)
 {
     NV2A_VK_DGROUP_BEGIN("%s", __func__);
@@ -453,9 +456,10 @@ static void update_shader_uniforms(PGRAPHState *pg)
     VshUniformValues vsh_values;
     pgraph_glsl_set_vsh_uniform_values(pg, &binding->state.vsh,
                                   binding->vsh.uniform_locs, &vsh_values);
-    apply_uniform_updates(&binding->vsh.module_info->uniforms, VshUniformInfo,
-                          binding->vsh.uniform_locs, &vsh_values,
-                          VshUniform__COUNT);
+    bool changed = apply_uniform_updates(&binding->vsh.module_info->uniforms,
+                                         VshUniformInfo,
+                                         binding->vsh.uniform_locs,
+                                         &vsh_values, VshUniform__COUNT);
 
     PshUniformValues psh_values;
     pgraph_glsl_set_psh_uniform_values(pg, binding->psh.uniform_locs,
@@ -474,16 +478,19 @@ static void update_shader_uniforms(PGRAPHState *pg)
 
         psh_values.texScale[i] = scale;
     }
-    apply_uniform_updates(&binding->psh.module_info->uniforms, PshUniformInfo,
-                          binding->psh.uniform_locs, &psh_values,
-                          PshUniform__COUNT);
+    changed |= apply_uniform_updates(&binding->psh.module_info->uniforms,
+                                     PshUniformInfo, binding->psh.uniform_locs,
+                                     &psh_values, PshUniform__COUNT);
 
+    /* Each layout's allocation holds the values last written to it, so a
+     * layout that was also the last one uploaded for its stage only needs
+     * uploading again when a value changed. */
+    changed |= r->shader_bindings_changed;
     for (int i = 0; i < ARRAY_SIZE(layouts); i++) {
-        uint64_t hash =
-            fast_hash(layouts[i]->allocation, layouts[i]->total_size);
-        r->uniforms_changed |= (hash != r->uniform_buffer_hashes[i]);
-        r->uniform_buffer_hashes[i] = hash;
+        changed |= layouts[i] != r->uniform_buffer_layouts[i];
+        r->uniform_buffer_layouts[i] = layouts[i];
     }
+    r->uniforms_changed |= changed;
 
     nv2a_profile_inc_counter(r->uniforms_changed ?
                                  NV2A_PROF_SHADER_UBO_DIRTY :

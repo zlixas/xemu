@@ -184,6 +184,7 @@ static void *rr_cpu_thread_fn(void *arg)
 
     assert(tcg_enabled());
     rcu_register_thread();
+    qemu_thread_set_latency_critical();
     force_rcu.notify = rr_force_rcu;
     rcu_add_force_rcu_notifier(&force_rcu);
     tcg_register_thread();

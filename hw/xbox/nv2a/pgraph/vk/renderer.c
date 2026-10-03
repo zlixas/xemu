@@ -22,13 +22,13 @@
 
 #include "gloffscreen.h"
 
-#if HAVE_EXTERNAL_MEMORY
+#if HAVE_GL_DISPLAY
 static GloContext *g_gl_context;
 #endif
 
 static void early_context_init(void)
 {
-#if HAVE_EXTERNAL_MEMORY
+#if HAVE_GL_DISPLAY
     g_gl_context = glo_context_create();
 #endif
 }
@@ -39,7 +39,7 @@ static void pgraph_vk_init(NV2AState *d, Error **errp)
 
     pg->vk_renderer_state = (PGRAPHVkState *)g_malloc0(sizeof(PGRAPHVkState));
 
-#if HAVE_EXTERNAL_MEMORY
+#if HAVE_GL_DISPLAY
     glo_set_current(g_gl_context);
 #endif
 
@@ -190,7 +190,7 @@ static int pgraph_vk_get_framebuffer_surface(NV2AState *d)
 
     surface->frame_time = pg->frame_time;
 
-#if HAVE_EXTERNAL_MEMORY
+#if HAVE_GL_DISPLAY
     qemu_event_reset(&d->pgraph.sync_complete);
     qatomic_set(&pg->sync_pending, true);
     pfifo_kick(d);

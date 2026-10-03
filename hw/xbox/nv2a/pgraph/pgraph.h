@@ -103,6 +103,8 @@ typedef struct GPUProperties {
         short tri_strip1;
         short tri_fan;
     } geom_shader_winding;
+    /* Host has no geometry shaders (e.g. MoltenVK): always use fast depth */
+    bool no_geometry_shader;
 } GPUProperties;
 
 typedef struct PGRAPHRenderer {
@@ -131,6 +133,7 @@ typedef struct PGRAPHRenderer {
         void (*set_surface_scale_factor)(NV2AState *d, unsigned int scale);
         unsigned int (*get_surface_scale_factor)(NV2AState *d);
         int (*get_framebuffer_surface)(NV2AState *d);
+        void (*release_framebuffer_surface)(NV2AState *d);
         GPUProperties *(*get_gpu_properties)(void);
     } ops;
 } PGRAPHRenderer;

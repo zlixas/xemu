@@ -4310,12 +4310,221 @@ static void i386_tr_insn_start(DisasContextBase *dcbase, CPUState *cpu)
     tcg_gen_insn_start(pc_arg, dc->cc_op);
 }
 
+#if defined(XBOX) && !defined(CONFIG_USER_ONLY)
+/*
+ * Does a TB start at the second nop of the Xbox kernel idle loop
+ * (sti; nop; [nop]; cli; cmp ebp,[ebp]; je ...)? See helper_xbox_idle.
+ */
+static bool is_xbox_idle_loop(DisasContext *dc, CPUX86State *env)
+{
+    /* sti; nop; | nop; cli; cmp ebp,[ebp+0]; je rel8 */
+    static const uint8_t sig[] = { 0xfb, 0x90, 0x90, 0xfa, 0x3b, 0x6d, 0x00, 0x74 };
+    const int before = 2;
+    vaddr pc = dc->base.pc_first;
+    vaddr offset = pc & ~TARGET_PAGE_MASK;
+
+    /* Whole signature must be on the TB's first page, which must be RAM */
+    if (dc->base.num_insns != 1 || CODE64(dc) || CPL(dc) != 0 ||
+        tb_page_addr0(dc->base.tb) == -1 || offset < before ||
+        offset > TARGET_PAGE_SIZE - (sizeof(sig) - before)) {
+        return false;
+    }
+    for (int i = 0; i < ARRAY_SIZE(sig); i++) {
+        if (translator_ldub(env, &dc->base, pc - before + i) != sig[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+#endif
+
+/*
+ * Length of the ModRM (+SIB, displacement) bytes at pc for 32-bit addressing,
+ * or 0 if unreadable. *is_reg tells whether r/m is a register.
+ */
+static int xbox_modrm_len(DisasContext *dc, CPUX86State *env, vaddr pc,
+                          bool *is_reg)
+{
+    int modrm = translator_ldub(env, &dc->base, pc);
+    int mod = modrm >> 6, rm = modrm & 7, len = 1;
+
+    *is_reg = mod == 3;
+    if (mod == 3) {
+        return 1;
+    }
+    if (rm == 4) {
+        int sib = translator_ldub(env, &dc->base, pc + 1);
+        len++;
+        if (mod == 0 && (sib & 7) == 5) {
+            len += 4;
+        }
+    } else if (mod == 0 && rm == 5) {
+        len += 4;
+    }
+    if (mod == 1) {
+        len += 1;
+    } else if (mod == 2) {
+        len += 4;
+    }
+    return len;
+}
+
+/*
+ * Does the TB at pc_first start a polling loop: a few instructions that load
+ * memory, compute and compare, ending in a conditional branch back to
+ * pc_first, with no stores and no state carried between iterations? E.g. the
+ * D3D push buffer fence wait
+ *     1: mov ecx,[edx]; mov edi,esi; sub edi,ecx; cmp eax,edi; jb 1b
+ * Each iteration then computes the same result until something else (GPU,
+ * interrupt) changes memory, so it can sleep between iterations (see
+ * helper_xbox_poll). Register modifications are only accepted on registers
+ * assigned earlier in the same iteration, which rejects counting loops like
+ * "dec ecx; jnz".
+ */
+static bool is_xbox_poll_loop(DisasContext *dc, CPUX86State *env)
+{
+    vaddr start = dc->base.pc_first, pc = start;
+    vaddr page_end = (start & TARGET_PAGE_MASK) + TARGET_PAGE_SIZE;
+    unsigned fresh = 0;        /* 32-bit registers assigned this iteration */
+    bool loads = false;
+
+    if (dc->base.num_insns != 1 || CODE64(dc) || !CODE32(dc) ||
+        tb_page_addr0(dc->base.tb) == -1) {
+        return false;
+    }
+
+    for (int n = 0; n < 8; n++) {
+        bool is_reg;
+        int len, op, modrm, reg, rm;
+
+        /* Stay inside the page: at most 2 + 1 + 1 + 4 + 4 bytes per insn */
+        if (pc + 16 > page_end) {
+            return false;
+        }
+        op = translator_ldub(env, &dc->base, pc);
+        modrm = translator_ldub(env, &dc->base, pc + 1);
+        reg = (modrm >> 3) & 7;
+        rm = modrm & 7;
+
+        switch (op) {
+        case 0x90:                                  /* nop */
+            len = 1;
+            break;
+        case 0xf3:                                  /* pause */
+            if (modrm != 0x90) {
+                return false;
+            }
+            len = 2;
+            break;
+        case 0x8b:                                  /* mov r32, r/m32 */
+            len = 1 + xbox_modrm_len(dc, env, pc + 1, &is_reg);
+            loads |= !is_reg;
+            fresh |= 1 << reg;
+            break;
+        case 0x8a:                                  /* mov r8, r/m8 */
+        case 0x38: case 0x39: case 0x3a: case 0x3b: /* cmp */
+        case 0x84: case 0x85:                       /* test */
+            len = 1 + xbox_modrm_len(dc, env, pc + 1, &is_reg);
+            loads |= !is_reg;
+            break;
+        case 0x03: case 0x0b: case 0x23:            /* add/or/and r32, r/m */
+        case 0x2b: case 0x33:                       /* sub/xor r32, r/m */
+            len = 1 + xbox_modrm_len(dc, env, pc + 1, &is_reg);
+            loads |= !is_reg;
+            if (!(fresh & (1 << reg))) {
+                return false;
+            }
+            break;
+        case 0x01: case 0x09: case 0x21:            /* add/or/and r/m32, r */
+        case 0x29: case 0x31:                       /* sub/xor r/m32, r */
+        case 0x89:                                  /* mov r/m32, r */
+            len = 1 + xbox_modrm_len(dc, env, pc + 1, &is_reg);
+            if (!is_reg || (op != 0x89 && !(fresh & (1 << rm)))) {
+                return false;
+            }
+            fresh |= 1 << rm;
+            break;
+        case 0x81: case 0x83:                       /* alu r/m32, imm */
+            len = 1 + xbox_modrm_len(dc, env, pc + 1, &is_reg) +
+                  (op == 0x81 ? 4 : 1);
+            if (reg == 7) {
+                loads |= !is_reg;                   /* cmp */
+            } else if (!is_reg || !(fresh & (1 << rm)) ||
+                       reg == 2 || reg == 3) {      /* no adc/sbb */
+                return false;
+            }
+            break;
+        case 0x80:                                  /* cmp r/m8, imm8 */
+            if (reg != 7) {
+                return false;
+            }
+            len = 2 + xbox_modrm_len(dc, env, pc + 1, &is_reg);
+            loads |= !is_reg;
+            break;
+        case 0xf6: case 0xf7:                       /* test r/m, imm */
+            if (reg != 0) {
+                return false;
+            }
+            len = 1 + xbox_modrm_len(dc, env, pc + 1, &is_reg) +
+                  (op == 0xf7 ? 4 : 1);
+            loads |= !is_reg;
+            break;
+        case 0x0f:
+            if (modrm == 0xb6 || modrm == 0xb7 ||   /* movzx/movsx */
+                modrm == 0xbe || modrm == 0xbf) {
+                int modrm2 = translator_ldub(env, &dc->base, pc + 2);
+                len = 2 + xbox_modrm_len(dc, env, pc + 2, &is_reg);
+                loads |= !is_reg;
+                fresh |= 1 << ((modrm2 >> 3) & 7);
+                break;
+            }
+            if (modrm >= 0x80 && modrm <= 0x8f) {   /* jcc rel32 */
+                int32_t rel = translator_ldl(env, &dc->base, pc + 2);
+                return loads && pc + 6 + rel == start;
+            }
+            return false;
+        case 0x70 ... 0x7f: {                       /* jcc rel8 */
+            int8_t rel = modrm;
+            return loads && pc + 2 + rel == start;
+        }
+        case 0x3c: case 0xa8:                       /* cmp/test al, imm8 */
+            len = 2;
+            break;
+        case 0x3d: case 0xa9:                       /* cmp/test eax, imm32 */
+            len = 5;
+            break;
+        case 0xb8 ... 0xbf:                         /* mov r32, imm32 */
+            fresh |= 1 << (op & 7);
+            len = 5;
+            break;
+        default:
+            return false;
+        }
+        pc += len;
+    }
+    return false;
+}
+
 static void i386_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
 {
     DisasContext *dc = container_of(dcbase, DisasContext, base);
     bool orig_cc_op_dirty = dc->cc_op_dirty;
     CCOp orig_cc_op = dc->cc_op;
     target_ulong orig_pc_save = dc->pc_save;
+
+#if defined(XBOX) && !defined(CONFIG_USER_ONLY)
+    if (is_xbox_idle_loop(dc, cpu_env(cpu))) {
+        gen_update_cc_op(dc);
+        gen_update_eip_cur(dc);
+        gen_helper_xbox_idle(tcg_env);
+        orig_cc_op_dirty = dc->cc_op_dirty;
+        orig_cc_op = dc->cc_op;
+        orig_pc_save = dc->pc_save;
+    } else if (is_xbox_poll_loop(dc, cpu_env(cpu))) {
+        gen_helper_xbox_poll(tcg_env,
+                             tcg_constant_i32((uint32_t)dc->base.pc_first));
+    }
+#endif
 
 #ifdef TARGET_VSYSCALL_PAGE
     /*

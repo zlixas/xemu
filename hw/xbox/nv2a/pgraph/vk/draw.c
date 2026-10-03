@@ -54,6 +54,10 @@ static VkPrimitiveTopology get_primitive_topology(PGRAPHState *pg)
     int polygon_mode = r->shader_binding->state.geom.polygon_front_mode;
     int primitive_mode = r->shader_binding->state.geom.primitive_mode;
 
+    if (pgraph_glsl_quads_as_triangles(&r->shader_binding->state.geom)) {
+        return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    }
+
     // FIXME: Replace with LUT
     switch (primitive_mode) {
     case PRIM_TYPE_POINTS:
@@ -240,6 +244,10 @@ void pgraph_vk_finalize_pipelines(PGRAPHState *pg)
 
     vkDestroyFence(r->device, r->command_buffer_fence, NULL);
     vkDestroySemaphore(r->device, r->command_buffer_semaphore, NULL);
+
+    g_free(r->quad_indices);
+    r->quad_indices = NULL;
+    r->quad_indices_capacity = 0;
 }
 
 static void init_render_pass_state(PGRAPHState *pg, RenderPassState *state)
@@ -802,6 +810,31 @@ static void create_pipeline(PGRAPHState *pg)
         .depthBiasEnable = VK_FALSE,
         .pNext = rasterizer_next_struct,
     };
+
+    if (r->shader_binding->state.geom.fast_depth) {
+        /* Without the geometry/fragment shader depth path, apply polygon
+         * offset with fixed function depth bias. */
+        uint32_t setupraster = pgraph_reg_r(pg, NV_PGRAPH_SETUPRASTER);
+        uint32_t enable_mask;
+        switch (r->shader_binding->state.geom.polygon_front_mode) {
+        case POLY_MODE_LINE:
+            enable_mask = NV_PGRAPH_SETUPRASTER_POFFSETLINEENABLE;
+            break;
+        case POLY_MODE_POINT:
+            enable_mask = NV_PGRAPH_SETUPRASTER_POFFSETPOINTENABLE;
+            break;
+        default:
+            enable_mask = NV_PGRAPH_SETUPRASTER_POFFSETFILLENABLE;
+            break;
+        }
+        if (setupraster & enable_mask) {
+            uint32_t zfactor_u32 = pgraph_reg_r(pg, NV_PGRAPH_ZOFFSETFACTOR);
+            uint32_t zbias_u32 = pgraph_reg_r(pg, NV_PGRAPH_ZOFFSETBIAS);
+            rasterizer.depthBiasEnable = VK_TRUE;
+            rasterizer.depthBiasSlopeFactor = *(float *)&zfactor_u32;
+            rasterizer.depthBiasConstantFactor = *(float *)&zbias_u32;
+        }
+    }
 
     if (pgraph_reg_r(pg, NV_PGRAPH_SETUPRASTER) & NV_PGRAPH_SETUPRASTER_CULLENABLE) {
         uint32_t cull_face = GET_MASK(pgraph_reg_r(pg, NV_PGRAPH_SETUPRASTER),
@@ -2018,6 +2051,41 @@ static void copy_remapped_attributes_to_inline_buffer(PGRAPHState *pg,
     buffer->buffer_offset += remap.buffer_space_required;
 }
 
+static uint32_t *get_quad_indices(PGRAPHVkState *r, size_t count)
+{
+    if (count > r->quad_indices_capacity) {
+        r->quad_indices_capacity = MAX(count, r->quad_indices_capacity * 2);
+        r->quad_indices = g_renew(uint32_t, r->quad_indices,
+                                  r->quad_indices_capacity);
+    }
+    return r->quad_indices;
+}
+
+/* Convert vertices 0..count-1 into r->quad_indices, reserving index space */
+static size_t prepare_quad_range(PGRAPHState *pg, const GeomState *geom,
+                                 size_t count)
+{
+    PGRAPHVkState *r = pg->vk_renderer_state;
+
+    uint32_t *indices = get_quad_indices(
+        r, pgraph_quad_tri_index_count(geom->primitive_mode, count));
+    size_t n = pgraph_quads_to_triangles(geom, NULL, 0, count, indices);
+    ensure_buffer_space(pg, BUFFER_INDEX_STAGING, n * sizeof(uint32_t));
+    return n;
+}
+
+static void draw_quad_indices(PGRAPHVkState *r, VkDeviceSize offset,
+                              size_t count)
+{
+    if (!count) {
+        return;
+    }
+    vkCmdBindIndexBuffer(r->command_buffer,
+                         r->storage_buffers[BUFFER_INDEX].buffer, offset,
+                         VK_INDEX_TYPE_UINT32);
+    vkCmdDrawIndexed(r->command_buffer, count, 1, 0, 0, 0);
+}
+
 void pgraph_vk_flush_draw(NV2AState *d)
 {
     PGRAPHState *pg = &d->pgraph;
@@ -2029,6 +2097,13 @@ void pgraph_vk_flush_draw(NV2AState *d)
     }
 
     r->num_vertex_ram_buffer_syncs = 0;
+
+    /* Shaders are bound later in begin_draw(), so derive the geometry state
+     * that binding will have from the registers. */
+    GeomState geom_state;
+    pgraph_glsl_get_geom_state(pg, &geom_state);
+    const GeomState *geom = &geom_state;
+    bool quads = pgraph_glsl_quads_as_triangles(geom);
 
     if (pg->draw_arrays_length) {
         NV2A_VK_DGROUP_BEGIN("Draw Arrays");
@@ -2050,17 +2125,43 @@ void pgraph_vk_flush_draw(NV2AState *d)
         sync_vertex_ram_buffer(pg);
         VertexBufferRemap remap = remap_unaligned_attributes(pg, max_element);
 
+        size_t num_quad_indices = 0;
+        if (quads) {
+            size_t total = 0;
+            for (int i = 0; i < pg->draw_arrays_length; i++) {
+                total += pgraph_quad_tri_index_count(geom->primitive_mode,
+                                                     pg->draw_arrays_count[i]);
+            }
+            uint32_t *indices = get_quad_indices(r, total);
+            for (int i = 0; i < pg->draw_arrays_length; i++) {
+                num_quad_indices += pgraph_quads_to_triangles(
+                    geom, NULL, pg->draw_arrays_start[i],
+                    pg->draw_arrays_count[i], indices + num_quad_indices);
+            }
+            ensure_buffer_space(pg, BUFFER_INDEX_STAGING,
+                                num_quad_indices * sizeof(uint32_t));
+        }
+
         begin_pre_draw(pg);
         copy_remapped_attributes_to_inline_buffer(pg, remap, 0, max_element);
+        VkDeviceSize index_offset = 0;
+        if (num_quad_indices) {
+            index_offset = pgraph_vk_update_index_buffer(
+                pg, r->quad_indices, num_quad_indices * sizeof(uint32_t));
+        }
         pgraph_vk_begin_debug_marker(r, r->command_buffer, RGBA_BLUE,
                                      "Draw Arrays");
         begin_draw(pg);
         bind_vertex_buffer(pg, remap.attributes, 0);
-        for (int i = 0; i < pg->draw_arrays_length; i++) {
-            uint32_t start = pg->draw_arrays_start[i],
-                     count = pg->draw_arrays_count[i];
-            NV2A_VK_DPRINTF("- [%d] Start:%d Count:%d", i, start, count);
-            vkCmdDraw(r->command_buffer, count, 1, start, 0);
+        if (quads) {
+            draw_quad_indices(r, index_offset, num_quad_indices);
+        } else {
+            for (int i = 0; i < pg->draw_arrays_length; i++) {
+                uint32_t start = pg->draw_arrays_start[i],
+                         count = pg->draw_arrays_count[i];
+                NV2A_VK_DPRINTF("- [%d] Start:%d Count:%d", i, start, count);
+                vkCmdDraw(r->command_buffer, count, 1, start, 0);
+            }
         }
         end_draw(pg);
         pgraph_vk_end_debug_marker(r, r->command_buffer);
@@ -2073,8 +2174,17 @@ void pgraph_vk_flush_draw(NV2AState *d)
 
         nv2a_profile_inc_counter(NV2A_PROF_INLINE_ELEMENTS);
 
-        size_t index_data_size =
-            pg->inline_elements_length * sizeof(pg->inline_elements[0]);
+        uint32_t *index_data = pg->inline_elements;
+        size_t index_count = pg->inline_elements_length;
+        if (quads) {
+            index_data = get_quad_indices(
+                r, pgraph_quad_tri_index_count(geom->primitive_mode,
+                                               index_count));
+            index_count = pgraph_quads_to_triangles(
+                geom, pg->inline_elements, 0, pg->inline_elements_length,
+                index_data);
+        }
+        size_t index_data_size = index_count * sizeof(uint32_t);
 
         ensure_buffer_space(pg, BUFFER_INDEX_STAGING, index_data_size);
 
@@ -2092,17 +2202,16 @@ void pgraph_vk_flush_draw(NV2AState *d)
 
         begin_pre_draw(pg);
         copy_remapped_attributes_to_inline_buffer(pg, remap, 0, max_element + 1);
-        VkDeviceSize buffer_offset = pgraph_vk_update_index_buffer(
-            pg, pg->inline_elements, index_data_size);
+        VkDeviceSize buffer_offset = 0;
+        if (index_count) {
+            buffer_offset = pgraph_vk_update_index_buffer(pg, index_data,
+                                                          index_data_size);
+        }
         pgraph_vk_begin_debug_marker(r, r->command_buffer, RGBA_BLUE,
                                      "Inline Elements");
         begin_draw(pg);
         bind_vertex_buffer(pg, remap.attributes, 0);
-        vkCmdBindIndexBuffer(r->command_buffer,
-                             r->storage_buffers[BUFFER_INDEX].buffer,
-                             buffer_offset, VK_INDEX_TYPE_UINT32);
-        vkCmdDrawIndexed(r->command_buffer, pg->inline_elements_length, 1, 0, 0,
-                         0);
+        draw_quad_indices(r, buffer_offset, index_count);
         end_draw(pg);
         pgraph_vk_end_debug_marker(r, r->command_buffer);
 
@@ -2131,15 +2240,26 @@ void pgraph_vk_flush_draw(NV2AState *d)
             offset += vertex_data_size;
         }
         ensure_buffer_space(pg, BUFFER_VERTEX_INLINE_STAGING, offset);
+        size_t num_quad_indices =
+            quads ? prepare_quad_range(pg, geom, pg->inline_buffer_length) : 0;
 
         begin_pre_draw(pg);
         VkDeviceSize buffer_offset = pgraph_vk_update_vertex_inline_buffer(
             pg, data, sizes, r->num_active_vertex_attribute_descriptions);
+        VkDeviceSize index_offset = 0;
+        if (num_quad_indices) {
+            index_offset = pgraph_vk_update_index_buffer(
+                pg, r->quad_indices, num_quad_indices * sizeof(uint32_t));
+        }
         pgraph_vk_begin_debug_marker(r, r->command_buffer, RGBA_BLUE,
                                      "Inline Buffer");
         begin_draw(pg);
         bind_inline_vertex_buffer(pg, buffer_offset);
-        vkCmdDraw(r->command_buffer, pg->inline_buffer_length, 1, 0, 0);
+        if (quads) {
+            draw_quad_indices(r, index_offset, num_quad_indices);
+        } else {
+            vkCmdDraw(r->command_buffer, pg->inline_buffer_length, 1, 0, 0);
+        }
         end_draw(pg);
         pgraph_vk_end_debug_marker(r, r->command_buffer);
 
@@ -2174,16 +2294,27 @@ void pgraph_vk_flush_draw(NV2AState *d)
         NV2A_DPRINTF("draw inline array %d, %d\n", vertex_size, index_count);
         pgraph_vk_bind_vertex_attributes(d, 0, index_count - 1, true,
                                          vertex_size, index_count - 1);
+        size_t num_quad_indices =
+            quads ? prepare_quad_range(pg, geom, index_count) : 0;
 
         begin_pre_draw(pg);
         void *inline_array_data = pg->inline_array;
         VkDeviceSize buffer_offset = pgraph_vk_update_vertex_inline_buffer(
             pg, &inline_array_data, &inline_array_data_size, 1);
+        VkDeviceSize index_offset = 0;
+        if (num_quad_indices) {
+            index_offset = pgraph_vk_update_index_buffer(
+                pg, r->quad_indices, num_quad_indices * sizeof(uint32_t));
+        }
         pgraph_vk_begin_debug_marker(r, r->command_buffer, RGBA_BLUE,
                                      "Inline Array");
         begin_draw(pg);
         bind_inline_vertex_buffer(pg, buffer_offset);
-        vkCmdDraw(r->command_buffer, index_count, 1, 0, 0);
+        if (quads) {
+            draw_quad_indices(r, index_offset, num_quad_indices);
+        } else {
+            vkCmdDraw(r->command_buffer, index_count, 1, 0, 0);
+        }
         end_draw(pg);
         pgraph_vk_end_debug_marker(r, r->command_buffer);
         NV2A_VK_DGROUP_END();

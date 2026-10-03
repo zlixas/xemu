@@ -252,12 +252,12 @@ static void render_surface_to(NV2AState *d, SurfaceBinding *surface,
 
     glViewport(0, 0, width, height);
     glColorMask(true, true, true, true);
-    glDisable(GL_DITHER);
-    glDisable(GL_SCISSOR_TEST);
-    glDisable(GL_BLEND);
-    glDisable(GL_STENCIL_TEST);
-    glDisable(GL_CULL_FACE);
-    glDisable(GL_DEPTH_TEST);
+    pgraph_gl_set_cap(r, DITHER, false);
+    pgraph_gl_set_cap(r, SCISSOR_TEST, false);
+    pgraph_gl_set_cap(r, BLEND, false);
+    pgraph_gl_set_cap(r, STENCIL_TEST, false);
+    pgraph_gl_set_cap(r, CULL_FACE, false);
+    pgraph_gl_set_cap(r, DEPTH_TEST, false);
     glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
     glClearColor(0.0f, 0.0f, 1.0f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);

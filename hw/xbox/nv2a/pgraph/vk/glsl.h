@@ -145,6 +145,48 @@ static inline void uniform_copy(ShaderUniformLayout *layout, int idx,
     }
 }
 
+/* Like uniform_copy, but only writes and reports elements that differ */
+static inline bool uniform_copy_if_changed(ShaderUniformLayout *layout, int idx,
+                                           void *values, size_t value_size,
+                                           size_t count)
+{
+    assert(idx > 0 && "invalid uniform index");
+
+    ShaderUniform *u = &layout->uniforms[idx - 1];
+    const size_t element_size = value_size * u->dim_v;
+
+    size_t bytes_remaining = value_size * count;
+    char *p_out = uniform_ptr(layout, idx);
+    char *p_max = p_out + layout->total_size;
+    char *p_in = (char *)values;
+    bool changed = false;
+
+    if (element_size == u->stride) {
+        /* Tightly packed: compare and copy as one block */
+        assert(p_out + bytes_remaining <= p_max);
+        if (memcmp(p_out, p_in, bytes_remaining)) {
+            memcpy(p_out, p_in, bytes_remaining);
+            changed = true;
+        }
+        return changed;
+    }
+
+    int index = 0;
+    while (bytes_remaining) {
+        assert((p_out + element_size) <= p_max);
+        assert(index < u->dim_a);
+        if (memcmp(p_out, p_in, element_size)) {
+            memcpy(p_out, p_in, element_size);
+            changed = true;
+        }
+        bytes_remaining -= element_size;
+        p_out += u->stride;
+        p_in += element_size;
+        index += 1;
+    }
+    return changed;
+}
+
 static inline
 void uniform1fv(ShaderUniformLayout *layout, int idx, size_t count, float *values)
 {

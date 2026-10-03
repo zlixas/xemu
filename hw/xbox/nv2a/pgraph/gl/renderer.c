@@ -51,6 +51,7 @@ static void pgraph_gl_init(NV2AState *d, Error **errp)
 
     /* fire up opengl */
     glo_set_current(g_nv2a_context_render);
+    pgraph_gl_invalidate_caps(r);
 
 #if DEBUG_NV2A_GL
     gl_debug_initialize();
@@ -207,6 +208,7 @@ static PGRAPHRenderer pgraph_gl_renderer = {
         .set_surface_scale_factor = pgraph_gl_set_surface_scale_factor,
         .get_surface_scale_factor = pgraph_gl_get_surface_scale_factor,
         .get_framebuffer_surface = pgraph_gl_get_framebuffer_surface,
+        .release_framebuffer_surface = pgraph_gl_release_framebuffer_surface,
         .get_gpu_properties = pgraph_gl_get_gpu_properties,
     }
 };

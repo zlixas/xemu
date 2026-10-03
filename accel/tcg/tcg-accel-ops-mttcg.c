@@ -70,6 +70,7 @@ static void *mttcg_cpu_thread_fn(void *arg)
     g_assert(!icount_enabled());
 
     rcu_register_thread();
+    qemu_thread_set_latency_critical();
     force_rcu.notifier.notify = mttcg_force_rcu;
     force_rcu.cpu = cpu;
     rcu_add_force_rcu_notifier(&force_rcu.notifier);

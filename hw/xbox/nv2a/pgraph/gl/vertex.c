@@ -297,6 +297,10 @@ void pgraph_gl_finalize_buffers(PGRAPHState *pg)
     g_free(r->element_cache_entries);
     r->element_cache_entries = NULL;
 
+    g_free(r->quad_indices);
+    r->quad_indices = NULL;
+    r->quad_indices_capacity = 0;
+
     glDeleteBuffers(NV2A_VERTEXSHADER_ATTRIBUTES, r->gl_inline_buffer);
     memset(r->gl_inline_buffer, 0, sizeof(r->gl_inline_buffer));
 

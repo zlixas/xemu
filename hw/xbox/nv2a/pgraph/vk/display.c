@@ -18,6 +18,9 @@
  */
 
 #include "renderer.h"
+#if HAVE_IOSURFACE_DISPLAY
+#include "iosurface.h"
+#endif
 #include <math.h>
 
 static uint8_t *convert_texture_data__CR8YB8CB8YA8(uint8_t *data_out,
@@ -320,7 +323,7 @@ static void create_render_pass(PGRAPHState *pg)
 
     VkAttachmentReference color_reference;
     attachment = (VkAttachmentDescription){
-        .format = VK_FORMAT_R8G8B8A8_UNORM,
+        .format = DISPLAY_VK_FORMAT,
         .samples = VK_SAMPLE_COUNT_1_BIT,
         .loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
         .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
@@ -552,6 +555,13 @@ static void destroy_current_display_image(PGRAPHState *pg)
     CloseHandle(d->handle);
     d->handle = 0;
 #endif
+#elif HAVE_IOSURFACE_DISPLAY
+    glDeleteFramebuffers(2, d->gl_fbo);
+    d->gl_fbo[0] = d->gl_fbo[1] = 0;
+    glDeleteTextures(1, &d->gl_texture_id);
+    d->gl_texture_id = 0;
+    glDeleteTextures(1, &d->gl_rect_texture);
+    d->gl_rect_texture = 0;
 #endif
 
     vkDestroyImageView(r->device, d->image_view, NULL);
@@ -562,6 +572,11 @@ static void destroy_current_display_image(PGRAPHState *pg)
 
     vkFreeMemory(r->device, d->memory, NULL);
     d->memory = VK_NULL_HANDLE;
+
+#if HAVE_IOSURFACE_DISPLAY
+    pgraph_vk_iosurface_release(d->iosurface);
+    d->iosurface = NULL;
+#endif
 
     d->draw_time = 0;
 }
@@ -578,10 +593,10 @@ static void create_display_image(PGRAPHState *pg, int width, int height)
         destroy_current_display_image(pg);
     }
 
-    const GLint gl_internal_format = GL_RGBA8;
     bool use_optimal_tiling = true;
 
 #if HAVE_EXTERNAL_MEMORY
+    const GLint gl_internal_format = GL_RGBA8;
     GLint num_tiling_types;
     glGetInternalformativ(GL_TEXTURE_2D, gl_internal_format,
                           GL_NUM_TILING_TYPES_EXT, 1, &num_tiling_types);
@@ -609,7 +624,7 @@ static void create_display_image(PGRAPHState *pg, int width, int height)
         .extent.depth = 1,
         .mipLevels = 1,
         .arrayLayers = 1,
-        .format = VK_FORMAT_R8G8B8A8_UNORM,
+        .format = DISPLAY_VK_FORMAT,
         .tiling = use_optimal_tiling ? VK_IMAGE_TILING_OPTIMAL : VK_IMAGE_TILING_LINEAR,
         .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
         .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
@@ -617,6 +632,15 @@ static void create_display_image(PGRAPHState *pg, int width, int height)
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
     };
 
+#if HAVE_IOSURFACE_DISPLAY
+    d->iosurface = pgraph_vk_iosurface_create(width, height);
+    assert(d->iosurface);
+    VkImportMetalIOSurfaceInfoEXT import_iosurface_info = {
+        .sType = VK_STRUCTURE_TYPE_IMPORT_METAL_IO_SURFACE_INFO_EXT,
+        .ioSurface = (IOSurfaceRef)d->iosurface,
+    };
+    image_create_info.pNext = &import_iosurface_info;
+#else
     VkExternalMemoryImageCreateInfo external_memory_image_create_info = {
         .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
 #ifdef WIN32
@@ -626,6 +650,7 @@ static void create_display_image(PGRAPHState *pg, int width, int height)
 #endif
     };
     image_create_info.pNext = &external_memory_image_create_info;
+#endif
 
     VK_CHECK(vkCreateImage(r->device, &image_create_info, NULL, &d->image));
 
@@ -641,6 +666,7 @@ static void create_display_image(PGRAPHState *pg, int width, int height)
                                       VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT),
     };
 
+#if HAVE_EXTERNAL_MEMORY
     VkExportMemoryAllocateInfo export_memory_alloc_info = {
         .sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
         .handleTypes =
@@ -652,6 +678,7 @@ static void create_display_image(PGRAPHState *pg, int width, int height)
             ,
     };
     alloc_info.pNext = &export_memory_alloc_info;
+#endif
 
     VK_CHECK(vkAllocateMemory(r->device, &alloc_info, NULL, &d->memory));
     VK_CHECK(vkBindImageMemory(r->device, d->image, d->memory, 0));
@@ -711,6 +738,33 @@ static void create_display_image(PGRAPHState *pg, int width, int height)
     glTexStorageMem2DEXT(GL_TEXTURE_2D, 1, gl_internal_format,
                          image_create_info.extent.width,
                          image_create_info.extent.height, d->gl_memory_obj, 0);
+    assert(glGetError() == GL_NO_ERROR);
+
+#elif HAVE_IOSURFACE_DISPLAY
+
+    /* GL can only wrap IOSurfaces as rectangle textures, while the UI samples
+     * a 2D texture: blit between them after each display render. */
+    glGenTextures(1, &d->gl_rect_texture);
+    glBindTexture(GL_TEXTURE_RECTANGLE, d->gl_rect_texture);
+    bool bound = pgraph_vk_iosurface_bind_gl_texture_rectangle(
+        d->iosurface, width, height);
+    assert(bound);
+
+    glGenTextures(1, &d->gl_texture_id);
+    glBindTexture(GL_TEXTURE_2D, d->gl_texture_id);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA,
+                 GL_UNSIGNED_BYTE, NULL);
+
+    glGenFramebuffers(2, d->gl_fbo);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, d->gl_fbo[0]);
+    glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                           GL_TEXTURE_RECTANGLE, d->gl_rect_texture, 0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, d->gl_fbo[1]);
+    glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                           GL_TEXTURE_2D, d->gl_texture_id, 0);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
     assert(glGetError() == GL_NO_ERROR);
 
 #endif // HAVE_EXTERNAL_MEMORY
@@ -925,7 +979,7 @@ static void render_display(PGRAPHState *pg, SurfaceBinding *surface)
                                       VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     pgraph_vk_transition_image_layout(
-        pg, cmd, disp->image, VK_FORMAT_R8G8B8A8_UNORM,
+        pg, cmd, disp->image, DISPLAY_VK_FORMAT,
         VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
 
     VkRenderPassBeginInfo render_pass_begin_info = {
@@ -990,13 +1044,23 @@ static void render_display(PGRAPHState *pg, SurfaceBinding *surface)
                                       VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
 
     pgraph_vk_transition_image_layout(pg, cmd, disp->image,
-                                      VK_FORMAT_R8G8B8_UNORM,
+                                      DISPLAY_VK_FORMAT,
                                       VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 
     pgraph_vk_end_debug_marker(r, cmd);
     pgraph_vk_end_single_time_commands(pg, cmd);
     nv2a_profile_inc_counter(NV2A_PROF_QUEUE_SUBMIT_5);
+
+#if HAVE_IOSURFACE_DISPLAY
+    /* The queue is idle, so the IOSurface holds the finished frame */
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, disp->gl_fbo[0]);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, disp->gl_fbo[1]);
+    glBlitFramebuffer(0, 0, disp->width, disp->height, 0, 0, disp->width,
+                      disp->height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glFlush();
+#endif
 
     disp->draw_time = surface->draw_time;
 }

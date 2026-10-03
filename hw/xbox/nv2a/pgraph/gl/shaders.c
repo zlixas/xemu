@@ -108,6 +108,10 @@ static void update_shader_uniform_locs(ShaderBinding *binding)
 {
     char tmp[64];
 
+    /* New program, nothing uploaded yet */
+    g_free(binding->uniform_cache);
+    binding->uniform_cache = NULL;
+
     for (int i = 0; i < ARRAY_SIZE(binding->uniform_locs.vsh); i++) {
         const char *name = VshUniformInfo[i].name;
         if (VshUniformInfo[i].count > 1) {
@@ -231,8 +235,12 @@ static void generate_shaders(PGRAPHGLState *r, ShaderBinding *binding)
     glUseProgram(program);
 
     binding->gl_program = program;
-    binding->gl_primitive_mode = get_gl_primitive_mode(
-        state->geom.polygon_front_mode, state->geom.primitive_mode);
+    binding->quads_as_triangles = pgraph_glsl_quads_as_triangles(&state->geom);
+    binding->gl_primitive_mode =
+        binding->quads_as_triangles ?
+            GL_TRIANGLES :
+            get_gl_primitive_mode(state->geom.polygon_front_mode,
+                                  state->geom.primitive_mode);
     binding->initialized = true;
 
     set_texture_sampler_uniforms(binding);
@@ -340,9 +348,13 @@ bool pgraph_gl_shader_load_from_memory(ShaderBinding *binding)
 
     binding->program = NULL;
     binding->gl_program = gl_program;
+    binding->quads_as_triangles =
+        pgraph_glsl_quads_as_triangles(&binding->state.geom);
     binding->gl_primitive_mode =
-        get_gl_primitive_mode(binding->state.geom.polygon_front_mode,
-                              binding->state.geom.primitive_mode);
+        binding->quads_as_triangles ?
+            GL_TRIANGLES :
+            get_gl_primitive_mode(binding->state.geom.polygon_front_mode,
+                                  binding->state.geom.primitive_mode);
     binding->initialized = true;
 
     set_texture_sampler_uniforms(binding);
@@ -519,6 +531,7 @@ static void shader_cache_entry_init(Lru *lru, LruNode *node, const void *state)
     binding->cached = false;
     binding->program = NULL;
     binding->save_thread = NULL;
+    binding->uniform_cache = NULL;
 }
 
 static void shader_cache_entry_post_evict(Lru *lru, LruNode *node)
@@ -538,6 +551,8 @@ static void shader_cache_entry_post_evict(Lru *lru, LruNode *node)
     binding->cached = false;
     binding->save_thread = NULL;
     binding->program = NULL;
+    g_free(binding->uniform_cache);
+    binding->uniform_cache = NULL;
     memset(&binding->state, 0, sizeof(ShaderState));
 }
 
@@ -718,15 +733,30 @@ void pgraph_gl_shader_cache_to_disk(ShaderBinding *binding)
     qemu_thread_create(binding->save_thread, name, shader_write_to_disk, binding, QEMU_THREAD_JOINABLE);
 }
 
-static void apply_uniform_updates(const UniformInfo *info, int *locs,
-                                  void *values, size_t count)
+/*
+ * Upload uniforms whose values differ from those last uploaded (cache), or
+ * all of them if upload_all. Returns whether anything was uploaded.
+ */
+static bool apply_uniform_updates(const UniformInfo *info, int *locs,
+                                  void *values, void *cache, bool upload_all,
+                                  size_t count)
 {
+    bool uploaded = false;
+
     for (int i = 0; i < count; i++) {
         if (locs[i] == -1) {
             continue;
         }
 
         void *value = (char*)values + info[i].val_offs;
+        void *cached = (char *)cache + info[i].val_offs;
+        size_t len = info[i].size * info[i].count;
+
+        if (!upload_all && !memcmp(value, cached, len)) {
+            continue;
+        }
+        memcpy(cached, value, len);
+        uploaded = true;
 
         switch (info[i].type) {
         case UniformElementType_uint:
@@ -762,19 +792,30 @@ static void apply_uniform_updates(const UniformInfo *info, int *locs,
     }
 
     assert(glGetError() == GL_NO_ERROR);
+    return uploaded;
 }
 
-// FIXME: Dirty tracking
 // FIXME: Consider UBO to align with VK renderer
 static void update_shader_uniforms(PGRAPHState *pg, ShaderBinding *binding)
 {
     PGRAPHGLState *r = pg->gl_renderer_state;
 
+    /* Program uniform values persist, so only upload what changed since
+     * this program was last drawn with. Re-uploading everything each draw
+     * (notably the 192 vertex shader constants) is costly, especially with
+     * the macOS GL-on-Metal driver.
+     */
+    bool upload_all = !binding->uniform_cache;
+    if (upload_all) {
+        binding->uniform_cache = g_malloc(sizeof(ShaderUniformCache));
+    }
+
     VshUniformValues vsh_values;
     pgraph_glsl_set_vsh_uniform_values(pg, &binding->state.vsh,
                                   binding->uniform_locs.vsh, &vsh_values);
-    apply_uniform_updates(VshUniformInfo, binding->uniform_locs.vsh,
-                          &vsh_values, VshUniform__COUNT);
+    bool dirty = apply_uniform_updates(VshUniformInfo, binding->uniform_locs.vsh,
+                                       &vsh_values, &binding->uniform_cache->vsh,
+                                       upload_all, VshUniform__COUNT);
 
     PshUniformValues psh_values;
     pgraph_glsl_set_psh_uniform_values(pg, binding->uniform_locs.psh, &psh_values);
@@ -785,8 +826,12 @@ static void update_shader_uniforms(PGRAPHState *pg, ShaderBinding *binding)
             psh_values.texScale[i] = scale;
         }
     }
-    apply_uniform_updates(PshUniformInfo, binding->uniform_locs.psh,
-                          &psh_values, PshUniform__COUNT);
+    dirty |= apply_uniform_updates(PshUniformInfo, binding->uniform_locs.psh,
+                                   &psh_values, &binding->uniform_cache->psh,
+                                   upload_all, PshUniform__COUNT);
+
+    nv2a_profile_inc_counter(dirty ? NV2A_PROF_SHADER_UBO_DIRTY :
+                                     NV2A_PROF_SHADER_UBO_NOTDIRTY);
 }
 
 void pgraph_gl_bind_shaders(PGRAPHState *pg)

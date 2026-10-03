@@ -2391,6 +2391,23 @@ if host_os == 'windows'
   vulkan = declare_dependency(compile_args: ['-DVK_USE_PLATFORM_WIN32_KHR'])
 elif host_os == 'linux'
   vulkan = dependency('vulkan')
+elif host_os == 'darwin'
+  # Vulkan via MoltenVK, loaded at runtime by volk. Only the Khronos headers
+  # are needed at build time.
+  vulkan_headers_dir = ''
+  foreach d : ['/opt/homebrew/opt/vulkan-headers/include',
+               '/usr/local/opt/vulkan-headers/include']
+    if vulkan_headers_dir == '' and fs.is_file(d / 'vulkan' / 'vulkan.h')
+      vulkan_headers_dir = d
+    endif
+  endforeach
+  if vulkan_headers_dir != ''
+    vulkan = declare_dependency(
+      compile_args: ['-DVK_USE_PLATFORM_METAL_EXT', '-DVK_ENABLE_BETA_EXTENSIONS',
+                     '-isystem', vulkan_headers_dir])
+  else
+    warning('Vulkan headers not found, building without Vulkan renderer')
+  endif
 endif
 
 if vulkan.found()
@@ -2413,6 +2430,9 @@ if vulkan.found()
   volk_opts.add_cmake_defines({'VOLK_STATIC_DEFINES': 'VK_NO_PROTOTYPES'})
   if host_os == 'windows'
     volk_opts.append_compile_args('c', '-DVK_USE_PLATFORM_WIN32_KHR=1')
+  elif host_os == 'darwin'
+    volk_opts.append_compile_args('c', '-DVK_USE_PLATFORM_METAL_EXT=1',
+                                  '-isystem', vulkan_headers_dir)
   endif
   volk_subproj = cmake.subproject('volk', options: volk_opts)
   volk = declare_dependency(compile_args: ['-DVK_NO_PROTOTYPES'],

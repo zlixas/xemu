@@ -104,20 +104,20 @@ void pgraph_gl_clear_surface(NV2AState *d, uint32_t parameter)
     pgraph_apply_scaling_factor(pg, &scissor_width, &scissor_height);
 
     /* FIXME: Respect window clip?!?! */
-    glEnable(GL_SCISSOR_TEST);
+    pgraph_gl_set_cap(r, SCISSOR_TEST, true);
     glScissor(xmin, ymin, scissor_width, scissor_height);
 
     /* Dither */
     /* FIXME: Maybe also disable it here? + GL implementation dependent */
     if (pgraph_reg_r(pg, NV_PGRAPH_CONTROL_0) & NV_PGRAPH_CONTROL_0_DITHERENABLE) {
-        glEnable(GL_DITHER);
+        pgraph_gl_set_cap(r, DITHER, true);
     } else {
-        glDisable(GL_DITHER);
+        pgraph_gl_set_cap(r, DITHER, false);
     }
 
     glClear(gl_mask);
 
-    glDisable(GL_SCISSOR_TEST);
+    pgraph_gl_set_cap(r, SCISSOR_TEST, false);
 
     pgraph_gl_set_surface_dirty(pg, write_color, write_zeta);
 
@@ -166,7 +166,7 @@ void pgraph_gl_draw_begin(NV2AState *d)
                            NV_PGRAPH_CONTROL_1_STENCIL_MASK_WRITE));
 
     if (pgraph_reg_r(pg, NV_PGRAPH_BLEND) & NV_PGRAPH_BLEND_EN) {
-        glEnable(GL_BLEND);
+        pgraph_gl_set_cap(r, BLEND, true);
         uint32_t sfactor = GET_MASK(pgraph_reg_r(pg, NV_PGRAPH_BLEND),
                                     NV_PGRAPH_BLEND_SFACTOR);
         uint32_t dfactor = GET_MASK(pgraph_reg_r(pg, NV_PGRAPH_BLEND),
@@ -187,7 +187,7 @@ void pgraph_gl_draw_begin(NV2AState *d)
         glBlendColor(gl_blend_color[0], gl_blend_color[1], gl_blend_color[2],
                      gl_blend_color[3]);
     } else {
-        glDisable(GL_BLEND);
+        pgraph_gl_set_cap(r, BLEND, false);
     }
 
     /* Face culling */
@@ -197,9 +197,9 @@ void pgraph_gl_draw_begin(NV2AState *d)
                                       NV_PGRAPH_SETUPRASTER_CULLCTRL);
         assert(cull_face < ARRAY_SIZE(pgraph_cull_face_gl_map));
         glCullFace(pgraph_cull_face_gl_map[cull_face]);
-        glEnable(GL_CULL_FACE);
+        pgraph_gl_set_cap(r, CULL_FACE, true);
     } else {
-        glDisable(GL_CULL_FACE);
+        pgraph_gl_set_cap(r, CULL_FACE, false);
     }
 
     /* Front-face select */
@@ -208,30 +208,63 @@ void pgraph_gl_draw_begin(NV2AState *d)
                     & NV_PGRAPH_SETUPRASTER_FRONTFACE
                         ? GL_CW : GL_CCW);
 
-    /* Polygon offset is handled in geometry and fragment shaders explicitly */
-    glDisable(GL_POLYGON_OFFSET_FILL);
-    glDisable(GL_POLYGON_OFFSET_LINE);
-    glDisable(GL_POLYGON_OFFSET_POINT);
+    const ShaderState *shader_state = &r->shader_binding->state;
+    bool fixed_function_depth =
+        shader_state->psh.fast_depth && !shader_state->psh.z_perspective;
+
+    if (fixed_function_depth) {
+        /* Fast depth path: depth is interpolated by fixed function, so apply
+         * polygon offset through GL.
+         * FIXME: GL implementation-specific, e.g. Mesa needs zbias * 0.5 to
+         * match Xbox.
+         */
+        uint32_t setupraster = pgraph_reg_r(pg, NV_PGRAPH_SETUPRASTER);
+        pgraph_gl_set_cap(r, POLYGON_OFFSET_FILL,
+                          setupraster & NV_PGRAPH_SETUPRASTER_POFFSETFILLENABLE);
+        pgraph_gl_set_cap(r, POLYGON_OFFSET_LINE,
+                          setupraster & NV_PGRAPH_SETUPRASTER_POFFSETLINEENABLE);
+        pgraph_gl_set_cap(r, POLYGON_OFFSET_POINT,
+                          setupraster & NV_PGRAPH_SETUPRASTER_POFFSETPOINTENABLE);
+        if (setupraster & (NV_PGRAPH_SETUPRASTER_POFFSETFILLENABLE |
+                           NV_PGRAPH_SETUPRASTER_POFFSETLINEENABLE |
+                           NV_PGRAPH_SETUPRASTER_POFFSETPOINTENABLE)) {
+            uint32_t zfactor_u32 = pgraph_reg_r(pg, NV_PGRAPH_ZOFFSETFACTOR);
+            uint32_t zbias_u32 = pgraph_reg_r(pg, NV_PGRAPH_ZOFFSETBIAS);
+            glPolygonOffset(*(float *)&zfactor_u32, *(float *)&zbias_u32);
+        }
+    } else {
+        /* Polygon offset is handled in geometry and fragment shaders */
+        pgraph_gl_set_cap(r, POLYGON_OFFSET_FILL, false);
+        pgraph_gl_set_cap(r, POLYGON_OFFSET_LINE, false);
+        pgraph_gl_set_cap(r, POLYGON_OFFSET_POINT, false);
+    }
 
     /* Depth testing */
     if (depth_test) {
-        glEnable(GL_DEPTH_TEST);
+        pgraph_gl_set_cap(r, DEPTH_TEST, true);
 
         uint32_t depth_func = GET_MASK(pgraph_reg_r(pg, NV_PGRAPH_CONTROL_0),
                                        NV_PGRAPH_CONTROL_0_ZFUNC);
         assert(depth_func < ARRAY_SIZE(pgraph_depth_func_gl_map));
         glDepthFunc(pgraph_depth_func_gl_map[depth_func]);
     } else {
-        glDisable(GL_DEPTH_TEST);
+        pgraph_gl_set_cap(r, DEPTH_TEST, false);
     }
 
-    glEnable(GL_DEPTH_CLAMP);
+    pgraph_gl_set_cap(r, DEPTH_CLAMP, true);
 
-    /* Set first vertex convention to match Vulkan default */
-    glProvokingVertex(GL_FIRST_VERTEX_CONVENTION);
+    if (shader_state->psh.fast_depth && !shader_state->geom.smooth_shading) {
+        /* No geometry shader to select the provoking vertex */
+        glProvokingVertex(shader_state->geom.first_vertex_is_provoking ?
+                              GL_FIRST_VERTEX_CONVENTION :
+                              GL_LAST_VERTEX_CONVENTION);
+    } else {
+        /* Set first vertex convention to match Vulkan default */
+        glProvokingVertex(GL_FIRST_VERTEX_CONVENTION);
+    }
 
     if (stencil_test) {
-        glEnable(GL_STENCIL_TEST);
+        pgraph_gl_set_cap(r, STENCIL_TEST, true);
 
         uint32_t stencil_func = GET_MASK(pgraph_reg_r(pg, NV_PGRAPH_CONTROL_1),
                                     NV_PGRAPH_CONTROL_1_STENCIL_FUNC);
@@ -262,36 +295,36 @@ void pgraph_gl_draw_begin(NV2AState *d)
             pgraph_stencil_op_gl_map[op_zpass]);
 
     } else {
-        glDisable(GL_STENCIL_TEST);
+        pgraph_gl_set_cap(r, STENCIL_TEST, false);
     }
 
     /* Dither */
     /* FIXME: GL implementation dependent */
     if (pgraph_reg_r(pg, NV_PGRAPH_CONTROL_0) &
             NV_PGRAPH_CONTROL_0_DITHERENABLE) {
-        glEnable(GL_DITHER);
+        pgraph_gl_set_cap(r, DITHER, true);
     } else {
-        glDisable(GL_DITHER);
+        pgraph_gl_set_cap(r, DITHER, false);
     }
 
-    glEnable(GL_PROGRAM_POINT_SIZE);
+    pgraph_gl_set_cap(r, PROGRAM_POINT_SIZE, true);
 
     bool anti_aliasing = GET_MASK(pgraph_reg_r(pg, NV_PGRAPH_ANTIALIASING), NV_PGRAPH_ANTIALIASING_ENABLE);
 
     /* Edge Antialiasing */
     if (!anti_aliasing && pgraph_reg_r(pg, NV_PGRAPH_SETUPRASTER) &
                               NV_PGRAPH_SETUPRASTER_LINESMOOTHENABLE) {
-        glEnable(GL_LINE_SMOOTH);
+        pgraph_gl_set_cap(r, LINE_SMOOTH, true);
         glLineWidth(MIN(r->supported_smooth_line_width_range[1], pg->surface_scale_factor));
     } else {
-        glDisable(GL_LINE_SMOOTH);
+        pgraph_gl_set_cap(r, LINE_SMOOTH, false);
         glLineWidth(MIN(r->supported_aliased_line_width_range[1], pg->surface_scale_factor));
     }
     if (!anti_aliasing && pgraph_reg_r(pg, NV_PGRAPH_SETUPRASTER) &
                               NV_PGRAPH_SETUPRASTER_POLYSMOOTHENABLE) {
-        glEnable(GL_POLYGON_SMOOTH);
+        pgraph_gl_set_cap(r, POLYGON_SMOOTH, true);
     } else {
-        glDisable(GL_POLYGON_SMOOTH);
+        pgraph_gl_set_cap(r, POLYGON_SMOOTH, false);
     }
 
     unsigned int vp_width = pg->surface_binding_dim.width,
@@ -312,7 +345,7 @@ void pgraph_gl_draw_begin(NV2AState *d)
     pgraph_apply_scaling_factor(pg, &xmin, &ymin);
     pgraph_apply_scaling_factor(pg, &scissor_width, &scissor_height);
 
-    glEnable(GL_SCISSOR_TEST);
+    pgraph_gl_set_cap(r, SCISSOR_TEST, true);
     glScissor(xmin, ymin, scissor_width, scissor_height);
 
     /* Visibility testing */
@@ -378,6 +411,53 @@ void pgraph_gl_draw_end(NV2AState *d)
     NV2A_GL_DGROUP_END();
 }
 
+static void draw_cached_elements(PGRAPHGLState *r, GLenum mode,
+                                 const uint32_t *indices, size_t count)
+{
+    VertexKey k;
+    memset(&k, 0, sizeof(VertexKey));
+    k.count = count;
+    k.gl_type = GL_UNSIGNED_INT;
+    k.gl_normalize = GL_FALSE;
+    k.stride = sizeof(uint32_t);
+    uint64_t h = fast_hash((uint8_t *)indices, count * 4);
+
+    LruNode *node = lru_lookup(&r->element_cache, h, &k);
+    VertexLruNode *found = container_of(node, VertexLruNode, node);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, found->gl_buffer);
+    if (!found->initialized) {
+        nv2a_profile_inc_counter(NV2A_PROF_GEOM_BUFFER_UPDATE_4);
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER, count * 4, indices,
+                     GL_STATIC_DRAW);
+        found->initialized = true;
+    } else {
+        nv2a_profile_inc_counter(NV2A_PROF_GEOM_BUFFER_UPDATE_4_NOTDIRTY);
+    }
+    glDrawElements(mode, count, GL_UNSIGNED_INT, (void *)0);
+}
+
+static uint32_t *get_quad_indices(PGRAPHGLState *r, size_t count)
+{
+    if (count > r->quad_indices_capacity) {
+        r->quad_indices_capacity = MAX(count, r->quad_indices_capacity * 2);
+        r->quad_indices = g_renew(uint32_t, r->quad_indices,
+                                  r->quad_indices_capacity);
+    }
+    return r->quad_indices;
+}
+
+/* Draw vertices first..first+count-1 as converted quad triangles */
+static void draw_quad_range(PGRAPHGLState *r, uint32_t first, size_t count)
+{
+    const GeomState *geom = &r->shader_binding->state.geom;
+    uint32_t *indices = get_quad_indices(
+        r, pgraph_quad_tri_index_count(geom->primitive_mode, count));
+    size_t n = pgraph_quads_to_triangles(geom, NULL, first, count, indices);
+    if (n) {
+        draw_cached_elements(r, GL_TRIANGLES, indices, n);
+    }
+}
+
 void pgraph_gl_flush_draw(NV2AState *d)
 {
     PGRAPHState *pg = &d->pgraph;
@@ -387,6 +467,9 @@ void pgraph_gl_flush_draw(NV2AState *d)
         return;
     }
     assert(r->shader_binding);
+
+    bool quads = r->shader_binding->quads_as_triangles;
+    const GeomState *geom = &r->shader_binding->state.geom;
 
     if (pg->draw_arrays_length) {
         NV2A_GL_DPRINTF(false, "Draw Arrays");
@@ -399,10 +482,29 @@ void pgraph_gl_flush_draw(NV2AState *d)
                                       pg->draw_arrays_max_count - 1,
                                       false, 0,
                                       pg->draw_arrays_max_count - 1);
-        glMultiDrawArrays(r->shader_binding->gl_primitive_mode,
-                          pg->draw_arrays_start,
-                          pg->draw_arrays_count,
-                          pg->draw_arrays_length);
+        if (quads) {
+            size_t total = 0;
+            for (int i = 0; i < pg->draw_arrays_length; i++) {
+                total += pgraph_quad_tri_index_count(geom->primitive_mode,
+                                                     pg->draw_arrays_count[i]);
+            }
+            uint32_t *indices = get_quad_indices(r, total);
+            size_t n = 0;
+            for (int i = 0; i < pg->draw_arrays_length; i++) {
+                n += pgraph_quads_to_triangles(geom, NULL,
+                                               pg->draw_arrays_start[i],
+                                               pg->draw_arrays_count[i],
+                                               indices + n);
+            }
+            if (n) {
+                draw_cached_elements(r, GL_TRIANGLES, indices, n);
+            }
+        } else {
+            glMultiDrawArrays(r->shader_binding->gl_primitive_mode,
+                              pg->draw_arrays_start,
+                              pg->draw_arrays_count,
+                              pg->draw_arrays_length);
+        }
     } else if (pg->inline_elements_length) {
         NV2A_GL_DPRINTF(false, "Inline Elements");
         nv2a_profile_inc_counter(NV2A_PROF_INLINE_ELEMENTS);
@@ -420,30 +522,21 @@ void pgraph_gl_flush_draw(NV2AState *d)
                 d, min_element, max_element, false, 0,
                 pg->inline_elements[pg->inline_elements_length - 1]);
 
-        VertexKey k;
-        memset(&k, 0, sizeof(VertexKey));
-        k.count = pg->inline_elements_length;
-        k.gl_type = GL_UNSIGNED_INT;
-        k.gl_normalize = GL_FALSE;
-        k.stride = sizeof(uint32_t);
-        uint64_t h = fast_hash((uint8_t*)pg->inline_elements,
-                               pg->inline_elements_length * 4);
-
-        LruNode *node = lru_lookup(&r->element_cache, h, &k);
-        VertexLruNode *found = container_of(node, VertexLruNode, node);
-        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, found->gl_buffer);
-        if (!found->initialized) {
-            nv2a_profile_inc_counter(NV2A_PROF_GEOM_BUFFER_UPDATE_4);
-            glBufferData(GL_ELEMENT_ARRAY_BUFFER,
-                         pg->inline_elements_length * 4,
-                         pg->inline_elements, GL_STATIC_DRAW);
-            found->initialized = true;
+        if (quads) {
+            uint32_t *indices = get_quad_indices(
+                r, pgraph_quad_tri_index_count(geom->primitive_mode,
+                                               pg->inline_elements_length));
+            size_t n = pgraph_quads_to_triangles(
+                geom, pg->inline_elements, 0,
+                pg->inline_elements_length, indices);
+            if (n) {
+                draw_cached_elements(r, GL_TRIANGLES, indices, n);
+            }
         } else {
-            nv2a_profile_inc_counter(NV2A_PROF_GEOM_BUFFER_UPDATE_4_NOTDIRTY);
+            draw_cached_elements(r, r->shader_binding->gl_primitive_mode,
+                                 pg->inline_elements,
+                                 pg->inline_elements_length);
         }
-        glDrawElements(r->shader_binding->gl_primitive_mode,
-                       pg->inline_elements_length, GL_UNSIGNED_INT,
-                       (void *)0);
     } else if (pg->inline_buffer_length) {
         NV2A_GL_DPRINTF(false, "Inline Buffer");
         nv2a_profile_inc_counter(NV2A_PROF_INLINE_BUFFERS);
@@ -452,6 +545,8 @@ void pgraph_gl_flush_draw(NV2AState *d)
         if (pg->compressed_attrs) {
             pg->compressed_attrs = 0;
             pgraph_gl_bind_shaders(pg);
+            quads = r->shader_binding->quads_as_triangles;
+            geom = &r->shader_binding->state.geom;
         }
 
         for (int i = 0; i < NV2A_VERTEXSHADER_ATTRIBUTES; i++) {
@@ -474,15 +569,23 @@ void pgraph_gl_flush_draw(NV2AState *d)
             }
         }
 
-        glDrawArrays(r->shader_binding->gl_primitive_mode,
-                     0, pg->inline_buffer_length);
+        if (quads) {
+            draw_quad_range(r, 0, pg->inline_buffer_length);
+        } else {
+            glDrawArrays(r->shader_binding->gl_primitive_mode,
+                         0, pg->inline_buffer_length);
+        }
     } else if (pg->inline_array_length) {
         NV2A_GL_DPRINTF(false, "Inline Array");
         nv2a_profile_inc_counter(NV2A_PROF_INLINE_ARRAYS);
 
         unsigned int index_count = pgraph_gl_bind_inline_array(d);
-        glDrawArrays(r->shader_binding->gl_primitive_mode,
-                     0, index_count);
+        if (quads) {
+            draw_quad_range(r, 0, index_count);
+        } else {
+            glDrawArrays(r->shader_binding->gl_primitive_mode,
+                         0, index_count);
+        }
     } else {
         NV2A_GL_DPRINTF(true, "EMPTY NV097_SET_BEGIN_END");
         NV2A_UNCONFIRMED("EMPTY NV097_SET_BEGIN_END");

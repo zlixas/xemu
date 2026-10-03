@@ -69,6 +69,7 @@ typedef struct PshState {
     bool smooth_shading;
     bool depth_clipping;
     bool z_perspective;
+    bool fast_depth;
 
     unsigned int surface_zeta_format;
     enum PshDepthFormat depth_format;

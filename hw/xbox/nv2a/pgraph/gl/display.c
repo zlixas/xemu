@@ -114,6 +114,15 @@ void pgraph_gl_finalize_display(PGRAPHState *pg)
 
     glo_set_current(g_nv2a_context_display);
 
+    if (r->display_fence) {
+        glDeleteSync(r->display_fence);
+        r->display_fence = 0;
+    }
+    if (r->ui_fence) {
+        glDeleteSync(r->ui_fence);
+        r->ui_fence = 0;
+    }
+
     glDeleteTextures(1, &r->gl_display_buffer);
     r->gl_display_buffer = 0;
 
@@ -363,13 +372,30 @@ static void render_display(NV2AState *d, SurfaceBinding *surface)
         GL_TEXTURE_2D, 0, 0);
 }
 
-static void gl_fence(void)
+/*
+ * Contexts sharing the display buffer are ordered with GPU-side waits instead
+ * of CPU fences, so neither the NV2A thread nor the UI thread stalls on GPU
+ * completion every frame:
+ *
+ *   render ctx:  upload surface -> fence U
+ *   display ctx: wait U, wait UI fence -> render display buffer -> fence D
+ *   render ctx:  wait D (later draws can't overwrite the surface early)
+ *   UI ctx:      wait D -> composite display buffer -> UI fence
+ */
+static GLsync gl_fence_flush(void)
 {
     GLsync fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
-    int result = glClientWaitSync(fence, GL_SYNC_FLUSH_COMMANDS_BIT,
-                                         (GLuint64)(5000000000));
-    assert(result == GL_CONDITION_SATISFIED || result == GL_ALREADY_SIGNALED);
-    glDeleteSync(fence);
+    glFlush();
+    return fence;
+}
+
+static void gl_wait_and_delete(GLsync *fence)
+{
+    if (*fence) {
+        glWaitSync(*fence, 0, GL_TIMEOUT_IGNORED);
+        glDeleteSync(*fence);
+        *fence = 0;
+    }
 }
 
 void pgraph_gl_sync(NV2AState *d)
@@ -385,19 +411,26 @@ void pgraph_gl_sync(NV2AState *d)
 
     /* FIXME: Sanity check surface dimensions */
 
-    /* Wait for queued commands to complete */
+    PGRAPHGLState *r = d->pgraph.gl_renderer_state;
+
+    /* Order display rendering after queued surface commands */
     pgraph_gl_upload_surface_data(d, surface, !tcg_enabled());
-    gl_fence();
+    GLsync upload_fence = gl_fence_flush();
     assert(glGetError() == GL_NO_ERROR);
 
     /* Render framebuffer in display context */
     glo_set_current(g_nv2a_context_display);
+    gl_wait_and_delete(&upload_fence);
+    gl_wait_and_delete(&r->ui_fence);
     render_display(d, surface);
-    gl_fence();
+    GLsync display_fence = gl_fence_flush();
     assert(glGetError() == GL_NO_ERROR);
 
     /* Switch back to original context */
     glo_set_current(g_nv2a_context_render);
+    glWaitSync(display_fence, 0, GL_TIMEOUT_IGNORED);
+    assert(r->display_fence == 0);
+    r->display_fence = display_fence;
 
     qatomic_set(&d->pgraph.sync_pending, false);
     qemu_event_set(&d->pgraph.sync_complete);
@@ -436,5 +469,21 @@ int pgraph_gl_get_framebuffer_surface(NV2AState *d)
     qemu_mutex_unlock(&d->pfifo.lock);
     qemu_event_wait(&d->pgraph.sync_complete);
 
+    /* Make the caller's context wait for the display buffer on the GPU */
+    gl_wait_and_delete(&r->display_fence);
+
     return r->gl_display_buffer;
+}
+
+void pgraph_gl_release_framebuffer_surface(NV2AState *d)
+{
+    PGRAPHGLState *r = d->pgraph.gl_renderer_state;
+
+    /* Next display render must not overwrite the buffer while the caller's
+     * context may still be sampling it.
+     */
+    if (r->ui_fence) {
+        glDeleteSync(r->ui_fence);
+    }
+    r->ui_fence = gl_fence_flush();
 }
