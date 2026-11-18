@@ -86,6 +86,29 @@ bool pgraph_glsl_need_geom(const GeomState *state)
     assert(state->polygon_front_mode == state->polygon_back_mode);
     enum ShaderPolygonMode polygon_mode = state->polygon_front_mode;
 
+    if (state->fast_depth) {
+        /* Only use the geometry shader where fixed-function GL can't draw the
+         * primitive: quads, non-fill polygon modes and flat shaded polygons.
+         */
+        switch (state->primitive_mode) {
+        case PRIM_TYPE_TRIANGLES:
+        case PRIM_TYPE_TRIANGLE_STRIP:
+        case PRIM_TYPE_TRIANGLE_FAN:
+            return polygon_mode != POLY_MODE_FILL;
+        case PRIM_TYPE_QUADS:
+        case PRIM_TYPE_QUAD_STRIP:
+            return true;
+        case PRIM_TYPE_POLYGON:
+            if (polygon_mode == POLY_MODE_POINT) {
+                assert(!"POLY_MODE_POINT not supported");
+                return false;
+            }
+            return polygon_mode == POLY_MODE_FILL && !state->smooth_shading;
+        default:
+            return false;
+        }
+    }
+
     switch (state->primitive_mode) {
     case PRIM_TYPE_POINTS:
         return false;

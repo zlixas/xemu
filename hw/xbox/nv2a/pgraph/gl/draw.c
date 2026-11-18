@@ -208,10 +208,45 @@ void pgraph_gl_draw_begin(NV2AState *d)
                     & NV_PGRAPH_SETUPRASTER_FRONTFACE
                         ? GL_CW : GL_CCW);
 
-    /* Polygon offset is handled in geometry and fragment shaders explicitly */
-    glDisable(GL_POLYGON_OFFSET_FILL);
-    glDisable(GL_POLYGON_OFFSET_LINE);
-    glDisable(GL_POLYGON_OFFSET_POINT);
+    const ShaderState *shader_state = &r->shader_binding->state;
+    bool fixed_function_depth =
+        shader_state->psh.fast_depth && !shader_state->psh.z_perspective;
+
+    if (fixed_function_depth) {
+        /* Fast depth path: depth is interpolated by fixed function, so apply
+         * polygon offset through GL.
+         * FIXME: GL implementation-specific, e.g. Mesa needs zbias * 0.5 to
+         * match Xbox.
+         */
+        uint32_t setupraster = pgraph_reg_r(pg, NV_PGRAPH_SETUPRASTER);
+        if (setupraster & NV_PGRAPH_SETUPRASTER_POFFSETFILLENABLE) {
+            glEnable(GL_POLYGON_OFFSET_FILL);
+        } else {
+            glDisable(GL_POLYGON_OFFSET_FILL);
+        }
+        if (setupraster & NV_PGRAPH_SETUPRASTER_POFFSETLINEENABLE) {
+            glEnable(GL_POLYGON_OFFSET_LINE);
+        } else {
+            glDisable(GL_POLYGON_OFFSET_LINE);
+        }
+        if (setupraster & NV_PGRAPH_SETUPRASTER_POFFSETPOINTENABLE) {
+            glEnable(GL_POLYGON_OFFSET_POINT);
+        } else {
+            glDisable(GL_POLYGON_OFFSET_POINT);
+        }
+        if (setupraster & (NV_PGRAPH_SETUPRASTER_POFFSETFILLENABLE |
+                           NV_PGRAPH_SETUPRASTER_POFFSETLINEENABLE |
+                           NV_PGRAPH_SETUPRASTER_POFFSETPOINTENABLE)) {
+            uint32_t zfactor_u32 = pgraph_reg_r(pg, NV_PGRAPH_ZOFFSETFACTOR);
+            uint32_t zbias_u32 = pgraph_reg_r(pg, NV_PGRAPH_ZOFFSETBIAS);
+            glPolygonOffset(*(float *)&zfactor_u32, *(float *)&zbias_u32);
+        }
+    } else {
+        /* Polygon offset is handled in geometry and fragment shaders */
+        glDisable(GL_POLYGON_OFFSET_FILL);
+        glDisable(GL_POLYGON_OFFSET_LINE);
+        glDisable(GL_POLYGON_OFFSET_POINT);
+    }
 
     /* Depth testing */
     if (depth_test) {
@@ -227,8 +262,15 @@ void pgraph_gl_draw_begin(NV2AState *d)
 
     glEnable(GL_DEPTH_CLAMP);
 
-    /* Set first vertex convention to match Vulkan default */
-    glProvokingVertex(GL_FIRST_VERTEX_CONVENTION);
+    if (shader_state->psh.fast_depth && !shader_state->geom.smooth_shading) {
+        /* No geometry shader to select the provoking vertex */
+        glProvokingVertex(shader_state->geom.first_vertex_is_provoking ?
+                              GL_FIRST_VERTEX_CONVENTION :
+                              GL_LAST_VERTEX_CONVENTION);
+    } else {
+        /* Set first vertex convention to match Vulkan default */
+        glProvokingVertex(GL_FIRST_VERTEX_CONVENTION);
+    }
 
     if (stencil_test) {
         glEnable(GL_STENCIL_TEST);

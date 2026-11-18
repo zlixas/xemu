@@ -18,7 +18,22 @@
  */
 
 #include "hw/xbox/nv2a/pgraph/pgraph.h"
+#include "ui/xemu-settings.h"
 #include "shaders.h"
+
+/*
+ * Fast depth: skip the geometry shader and per-fragment depth reconstruction
+ * used for depth precision where fixed-function rasterization suffices. This
+ * is much faster on hosts with slow or emulated geometry shaders, and leaves
+ * early depth testing enabled, at the cost of depth accuracy in some titles.
+ * Only the OpenGL renderer implements the fixed-function polygon offset this
+ * relies on.
+ */
+static bool use_fast_depth(PGRAPHState *pg)
+{
+    return g_config.display.quality.fast_depth &&
+           pg->renderer->type == CONFIG_DISPLAY_RENDERER_OPENGL;
+}
 
 ShaderState pgraph_glsl_get_shader_state(PGRAPHState *pg)
 {
@@ -32,6 +47,13 @@ ShaderState pgraph_glsl_get_shader_state(PGRAPHState *pg)
     pgraph_glsl_set_vsh_state(pg, &state.vsh);
     pgraph_glsl_set_geom_state(pg, &state.geom);
     pgraph_glsl_set_psh_state(pg, &state.psh);
+
+    /* All primitives must use the same depth method, including those still
+     * drawn through the geometry shader, or multi-pass rendering of the same
+     * geometry gets mismatched depth values and z-fights.
+     */
+    state.geom.fast_depth = use_fast_depth(pg);
+    state.psh.fast_depth = state.geom.fast_depth;
 
     return state;
 }
@@ -74,7 +96,8 @@ bool pgraph_glsl_check_shader_state_dirty(PGRAPHState *pg,
         pg->compressed_attrs != state->vsh.compressed_attrs ||
         pg->primitive_mode != state->geom.primitive_mode ||
         pg->surface_scale_factor != state->vsh.surface_scale_factor ||
-        pg->surface_shape.zeta_format != state->psh.surface_zeta_format) {
+        pg->surface_shape.zeta_format != state->psh.surface_zeta_format ||
+        use_fast_depth(pg) != state->geom.fast_depth) {
         return true;
     }
 
