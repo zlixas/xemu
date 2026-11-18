@@ -1,0 +1,10 @@
+*.inl
+*.obj
+*.d
+*.iso
+*.exe
+*.lib
+*.manifest
+*.pdb
+bin/
+build.log

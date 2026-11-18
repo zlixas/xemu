@@ -1,0 +1,50 @@
+!!VP1.1
+# Heavy vertex program: screen transform plus procedural normal, diffuse and
+# specular lighting (LIT), EXP/LOG driven texture animation and fog.
+#   c[0..3]  object -> screen matrix (rows)
+#   c[4]     x = time phase
+#   c[5]     wave frequency
+#   c[6]     wave bias (keeps RSQ inputs positive)
+#   c[7]     light direction
+#   c[8]     x = 0, w = specular power
+#   c[9]     half vector
+#   c[10]    ambient color
+#   c[11]    specular color
+#   c[12]    texcoord scroll scale
+#   c[13]    texcoord scale for stage 2
+#   c[14]    normal perturbation for stage 2
+DP4 R0.x, v[OPOS], c[0];
+DP4 R0.y, v[OPOS], c[1];
+DP4 R0.z, v[OPOS], c[2];
+DP4 R0.w, v[OPOS], c[3];
+RCP R1.x, R0.w;
+MUL o[HPOS].xyz, R0, R1.x;
+MOV o[HPOS].w, R0.w;
+
+MUL R2, v[OPOS], c[5];
+ADD R2, R2, c[4].x;
+MAD R3, R2, R2, c[6];
+RSQ R4.x, R3.x;
+RSQ R4.y, R3.y;
+RSQ R4.z, R3.z;
+DP3 R5.x, R4, R4;
+RSQ R5.x, R5.x;
+MUL R4.xyz, R4, R5.x;
+
+DP3 R7.x, R4, c[7];
+DP3 R7.y, R4, c[9];
+MOV R7.w, c[8].w;
+LIT R8, R7;
+MAD R9, v[COL0], R8.y, c[10];
+MOV o[COL0], R9;
+MUL o[COL1], c[11], R8.z;
+
+EXP R10, R2.x;
+LOG R11, R3.y;
+MOV o[TEX0], v[TEX0];
+MAD o[TEX1], v[TEX0], c[12], R10.y;
+MUL R6, v[TEX0], c[13];
+MAD o[TEX2], R4, c[14], R6;
+MAD o[TEX3], R11.y, c[12], R6;
+MOV o[FOGC].x, R0.w;
+END
